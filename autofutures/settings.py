@@ -71,8 +71,8 @@ ASGI_APPLICATION = 'autofutures.asgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.getenv('MYSQL_DATABASE', 'autofutures'),
-        'USER': os.getenv('MYSQL_USER', 'autofutures'),
+        'NAME': os.getenv('MYSQL_DATABASE', 'autofutures_new'),
+        'USER': os.getenv('MYSQL_USER', 'autofutures_new'),
         'PASSWORD': os.getenv('MYSQL_PASSWORD', 'Secure_Password_123!'),
         'HOST': os.getenv('DB_HOST', 'localhost'),
         'PORT': os.getenv('DB_PORT', '3306'),
