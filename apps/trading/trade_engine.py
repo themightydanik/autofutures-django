@@ -1,120 +1,151 @@
 # ===== apps/trading/trade_engine.py =====
 import asyncio
-from datetime import datetime
-from typing import Dict
-from .models import Trade, BotLog
+import datetime
 import logging
+import json
+
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
+
+from django.utils import timezone
+
+from .models import BotState, UserSymbolSettings, BotLog
 
 logger = logging.getLogger(__name__)
 
+
 class TradeEngine:
-    """Trading bot engine"""
-    
+
     def __init__(self):
-        self.active_bots = {}  # {user_id: is_running}
-        self.bot_tasks = {}  # {user_id: task}
-        self.trade_params = {}  # {user_id: params}
-    
-    async def start_trading(self, user, settings, params):
-        """Start trading bot"""
-        user_id = str(user.id)
-        
-        if user_id in self.active_bots and self.active_bots[user_id]:
-            raise ValueError("Bot is already running")
-        
-        self.trade_params[user_id] = params
-        self.active_bots[user_id] = True
-        
-        # Create log
-        BotLog.objects.create(
+        # Рабочие процессы для каждого юзера/символа
+        self.active_tasks = {}   # key: f"{user_id}:{symbol}"
+        self.running = {}        # key: f"{user_id}:{symbol}" → bool
+
+        # Websocket channel layer
+        self.channel_layer = get_channel_layer()
+
+    # ======================================================
+    # Запустить бота
+    # ======================================================
+    def start(self, symbol: str, user):
+        key = f"{user.id}:{symbol}"
+
+        # Уже запущен?
+        if key in self.running and self.running[key]:
+            logger.info(f"Bot already running for {key}")
+            return
+
+        self.running[key] = True
+
+        # Создаём таск
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(self.main_loop(symbol, user))
+        self.active_tasks[key] = task
+
+        logger.info(f"Bot started for {key}")
+
+    # ======================================================
+    # Остановить бота
+    # ======================================================
+    def stop(self, symbol: str, user):
+        key = f"{user.id}:{symbol}"
+        self.running[key] = False
+
+        logger.info(f"Stop requested for bot {key}")
+
+    # ======================================================
+    # Основной цикл бота
+    # ======================================================
+    async def main_loop(self, symbol: str, user):
+        key = f"{user.id}:{symbol}"
+        logger.info(f"Main loop started for {key}")
+
+        while self.running.get(key, False):
+
+            try:
+                await self.update_bot_state(symbol, user)
+                await asyncio.sleep(1.0)  # обновление раз в секунду
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Bot loop error for {key}: {e}")
+
+        logger.info(f"Bot main loop finished for {key}")
+
+    # ======================================================
+    # Обновление данных — вызывается каждую секунду
+    # ======================================================
+    async def update_bot_state(self, symbol, user):
+
+        # 1. Получаем настройки пользователя
+        try:
+            settings = UserSymbolSettings.objects.get(user=user, symbol=symbol)
+        except UserSymbolSettings.DoesNotExist:
+            logger.warning(f"No settings for user {user.id}, symbol {symbol}")
+            return
+
+        # 2. Получаем или создаём состояние бота
+        bot, _ = BotState.objects.update_or_create(
             user=user,
-            log_type='success',
-            message='🚀 Бот запущен! Начинаю мониторинг рынка...'
+            symbol=symbol,
+            defaults={"last_update": timezone.now()}
         )
-        
-        # Start trading loop
-        if settings['trade_type'] == 'arbitrage':
-            task = asyncio.create_task(self._arbitrage_loop(user_id, user))
-        else:
-            task = asyncio.create_task(self._margin_trading_loop(user_id, user))
-        
-        self.bot_tasks[user_id] = task
-        logger.info(f"Trading bot started for user {user_id}")
-    
-    async def stop_trading(self, user):
-        """Stop trading bot"""
-        user_id = str(user.id)
-        
-        if user_id in self.active_bots:
-            self.active_bots[user_id] = False
-            
-            if user_id in self.bot_tasks:
-                self.bot_tasks[user_id].cancel()
-                try:
-                    await self.bot_tasks[user_id]
-                except asyncio.CancelledError:
-                    pass
-                del self.bot_tasks[user_id]
-            
-            BotLog.objects.create(
-                user=user,
-                log_type='info',
-                message='⏸️ Бот остановлен. Открытые позиции сохранены.'
-            )
-            logger.info(f"Trading bot stopped for user {user_id}")
-    
-    async def _arbitrage_loop(self, user_id, user):
-        """Arbitrage trading loop"""
-        while self.active_bots.get(user_id, False):
-            try:
-                BotLog.objects.create(
-                    user=user,
-                    log_type='search',
-                    message='🔍 Анализирую спреды между биржами...'
-                )
-                
-                # TODO: Implement real arbitrage logic
-                await asyncio.sleep(15)
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in arbitrage loop: {str(e)}")
-                BotLog.objects.create(
-                    user=user,
-                    log_type='error',
-                    message=f'❌ Ошибка: {str(e)}'
-                )
-                await asyncio.sleep(10)
-    
-    async def _margin_trading_loop(self, user_id, user):
-        """Margin trading loop"""
-        while self.active_bots.get(user_id, False):
-            try:
-                BotLog.objects.create(
-                    user=user,
-                    log_type='search',
-                    message='📈 Анализирую графики для входа в позицию...'
-                )
-                
-                # TODO: Implement real margin trading logic
-                await asyncio.sleep(30)
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in margin trading loop: {str(e)}")
-                await asyncio.sleep(10)
-    
-    def get_status(self, user_id):
-        """Get trading status"""
+
+        # 3. Эмуляция реальных биржевых данных
+        # позже тут будет вызов exchange_service
+        import random
+        bid1 = random.uniform(0.5, 2.0)
+        ask1 = bid1 + random.uniform(0.01, 0.03)
+
+        bid2 = random.uniform(0.5, 2.0)
+        ask2 = bid2 + random.uniform(0.01, 0.03)
+
+        open_spread = (bid2 - ask1) / ask1 * 100
+        close_spread = (bid1 - ask2) / ask2 * 100
+
+        # 4. Обновляем состояние бота
+        bot.data = {
+            "exchange_1": settings.exchange_1,
+            "exchange_2": settings.exchange_2,
+            "side": settings.side,
+            "open_spread": float(open_spread),
+            "close_spread": float(close_spread),
+            "timestamp": str(datetime.datetime.now()),
+            "bid_1": bid1,
+            "ask_1": ask1,
+            "bid_2": bid2,
+            "ask_2": ask2,
+        }
+        bot.save()
+
+        # 5. Отправляем обновление фронтенду
+        await self.push_ws_update(user, symbol, bot.data)
+
+    # ======================================================
+    # WebSocket push
+    # ======================================================
+    async def push_ws_update(self, user, symbol, data):
+        group = f"user_{user.id}"
+
+        await self.channel_layer.group_send(
+            group,
+            {
+                "type": "bot.update",
+                "symbol": symbol,
+                "data": data,
+            }
+        )
+
+    # ======================================================
+    # Вспомогательная: Websocket handler
+    # ======================================================
+    @staticmethod
+    def format_ws_message(event):
         return {
-            'is_running': self.active_bots.get(user_id, False),
-            'active_trades_count': 0,  # TODO
-            'total_trades': 0,  # TODO
-            'total_pnl': 0,  # TODO
-            'pnl_percent': 0,  # TODO
+            "symbol": event.get("symbol"),
+            "data": event.get("data"),
         }
 
-# Global instance
+
+# Синглтон
 trade_engine = TradeEngine()
