@@ -7,84 +7,94 @@ from rest_framework.response import Response
 from django.db import transaction
 from django.utils import timezone
 
+import asyncio
+import logging
+
 from .models import (
     Trade,
     BotLog,
     UserSymbolSettings,
-    BotState,
+    BotState
 )
 
 from .serializers import (
     TradeSerializer,
     BotLogSerializer,
     UserSymbolSettingsSerializer,
-    BotStateSerializer,
     FullSymbolStateSerializer,
 )
 
-from .trade_engine import trade_engine   # новый движок будет под новую архитектуру
+from .trade_engine import trade_engine
 
-import logging
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 1.  SETTINGS LOGIC — SAVE / GET USER SETTINGS FOR SYMBOL
+# 1.  USER SETTINGS FOR SYMBOL
 # ============================================================
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_symbol_settings(request, symbol):
-    """
-    Получить сохранённые настройки карточки для монеты.
-    """
-    try:
-        settings = UserSymbolSettings.objects.get(user=request.user, symbol=symbol.upper())
-        serializer = UserSymbolSettingsSerializer(settings)
-        return Response(serializer.data)
-    except UserSymbolSettings.DoesNotExist:
-        # Вернуть пустые дефолтные значения
-        return Response({
-            "symbol": symbol.upper(),
-            "message": "No settings defined yet"
-        }, status=status.HTTP_204_NO_CONTENT)
+    symbol = symbol.upper()
+
+    settings = UserSymbolSettings.objects.filter(
+        user=request.user, symbol=symbol
+    ).first()
+
+    if not settings:
+        return Response(
+            {"symbol": symbol, "message": "No settings defined yet"},
+            status=status.HTTP_204_NO_CONTENT
+        )
+
+    return Response(UserSymbolSettingsSerializer(settings).data)
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def save_symbol_settings(request, symbol):
     """
-    Сохранить настройки карточки монеты.
+    Сохраняем настройки карточки монеты через сериализатор.
     """
     symbol = symbol.upper()
+
+    serializer = UserSymbolSettingsSerializer(
+        data=request.data,
+        partial=True
+    )
+
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated = serializer.validated_data
 
     try:
         with transaction.atomic():
-            obj, _ = UserSymbolSettings.objects.update_or_create(
+            UserSymbolSettings.objects.update_or_create(
                 user=request.user,
                 symbol=symbol,
-                defaults=request.data
+                defaults=validated
             )
-            return Response({"success": True})
+
+        return Response({"success": True})
+
     except Exception as e:
-        logger.error(f"Error saving settings: {e}")
-        return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        logger.error(f"Error saving symbol settings: {e}")
+        return Response({"detail": str(e)}, status=400)
 
 
 # ============================================================
-# 2. BOT START / STOP / STATUS
+# 2.  BOT START / STOP / STATUS FOR SYMBOL
 # ============================================================
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def start_bot(request, symbol):
-    """
-    Запускаем бота для монеты (входит в режим ожидания подходящего спреда).
-    """
     symbol = symbol.upper()
 
     try:
-        # Создаем / обновляем состояние бота
+        # mark bot active
         bot, _ = BotState.objects.update_or_create(
             user=request.user,
             symbol=symbol,
@@ -96,78 +106,85 @@ def start_bot(request, symbol):
             }
         )
 
-        # Сообщаем движку
-        trade_engine.start(symbol=symbol, user=request.user)
+        # launch engine task
+        asyncio.get_event_loop().create_task(
+            trade_engine.start(symbol=symbol, user=request.user)
+        )
 
         return Response({"success": True, "status": "started"})
+
     except Exception as e:
         logger.error(f"Bot start failed: {e}")
-        return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": str(e)}, status=400)
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def stop_bot(request, symbol):
     symbol = symbol.upper()
 
     try:
-        BotState.objects.filter(user=request.user, symbol=symbol).update(
-            is_active=False,
-            last_update=timezone.now()
+        BotState.objects.filter(
+            user=request.user, symbol=symbol
+        ).update(is_active=False, last_update=timezone.now())
+
+        asyncio.get_event_loop().create_task(
+            trade_engine.stop(symbol=symbol, user=request.user)
         )
 
-        trade_engine.stop(symbol=symbol, user=request.user)
-
         return Response({"success": True, "status": "stopped"})
+
     except Exception as e:
         logger.error(f"Bot stop failed: {e}")
-        return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": str(e)}, status=400)
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_bot_state(request, symbol):
     symbol = symbol.upper()
 
-    try:
-        settings = UserSymbolSettings.objects.get(user=request.user, symbol=symbol)
-        bot_state = BotState.objects.filter(user=request.user, symbol=symbol).first()
+    settings = UserSymbolSettings.objects.filter(
+        user=request.user, symbol=symbol
+    ).first()
 
-        combined = FullSymbolStateSerializer({
-            "settings": settings,
-            "bot_state": bot_state
-        })
-
-        return Response(combined.data)
-
-    except UserSymbolSettings.DoesNotExist:
+    if not settings:
         return Response({"detail": "No settings found"}, status=404)
 
+    bot_state = BotState.objects.filter(
+        user=request.user, symbol=symbol
+    ).first()
+
+    combined = {
+        "settings": settings,
+        "bot_state": bot_state
+    }
+
+    return Response(FullSymbolStateSerializer(combined).data)
+
 
 # ============================================================
-# 3.  HISTORICAL TRADES AND LOGS
+# 3. TRADES AND LOGS
 # ============================================================
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_active_trades(request):
-    trades = Trade.objects.filter(user=request.user, status='active')
+    trades = Trade.objects.filter(user=request.user, status="active")
     return Response(TradeSerializer(trades, many=True).data)
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_trade_history(request):
-    limit = int(request.query_params.get('limit', 100))
-    trades = Trade.objects.filter(user=request.user, status='completed')[:limit]
+    limit = int(request.query_params.get("limit", 100))
+    trades = Trade.objects.filter(user=request.user, status="completed")[:limit]
     return Response(TradeSerializer(trades, many=True).data)
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_bot_logs(request):
-    limit = int(request.query_params.get('limit', 50))
+    limit = int(request.query_params.get("limit", 50))
     logs = BotLog.objects.filter(user=request.user)[:limit]
-    return Response({
-        "logs": BotLogSerializer(logs, many=True).data
-    })
+    return Response({"logs": BotLogSerializer(logs, many=True).data})
