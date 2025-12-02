@@ -90,3 +90,103 @@ class BotLog(models.Model):
     
     def __str__(self):
         return f"{self.user.username} - {self.log_type} - {self.created_at}"
+
+# ===== NEW MODELS BELOW =====
+
+class UserSymbolSettings(models.Model):
+    """
+    Персональные настройки для каждой монеты:
+    - биржи
+    - направление (LONG/SHORT)
+    - спреды
+    - объемы
+    - ограничения
+    - настройки тиков
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='symbol_settings'
+    )
+
+    symbol = models.CharField(max_length=30)  # BTC, ETH, BEAT…
+
+    # Биржи
+    exchange_1 = models.CharField(max_length=50)
+    exchange_2 = models.CharField(max_length=50)
+
+    # LONG / SHORT
+    side = models.CharField(max_length=10, choices=[
+        ('long', 'Long'),
+        ('short', 'Short')
+    ])
+
+    # Спреды для открытия/закрытия
+    open_spread = models.FloatField(default=0.0)
+    close_spread = models.FloatField(default=0.0)
+
+    # Объемы ордеров
+    order_size = models.FloatField(default=0.0)   # в монетах
+    max_orders = models.IntegerField(default=0)
+
+    # Stop-флаги
+    force_stop = models.BooleanField(default=False)
+    total_stop = models.BooleanField(default=False)
+
+    # Количество тиков графика
+    open_ticks = models.IntegerField(default=0)
+    close_ticks = models.IntegerField(default=0)
+
+    # Автоматические поля
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "user_symbol_settings"
+        unique_together = ('user', 'symbol')
+        indexes = [
+            models.Index(fields=['user', 'symbol']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.username} – {self.symbol} settings"
+
+
+class BotState(models.Model):
+    """
+    Текущее состояние торгового бота по каждой монете.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='bot_states'
+    )
+
+    symbol = models.CharField(max_length=30)
+
+    # активен ли бот
+    is_active = models.BooleanField(default=False)
+
+    # когда стартовал
+    started_at = models.DateTimeField(null=True, blank=True)
+
+    # Биржевые данные (обновляются в реальном времени)
+    data = models.JSONField(default=dict, blank=True)
+
+    # последняя активность
+    last_update = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'bot_state'
+        unique_together = ('user', 'symbol')
+        indexes = [
+            models.Index(fields=['user', 'symbol']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.username} – {self.symbol} bot state"
+
