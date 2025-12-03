@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 1.  USER SETTINGS FOR SYMBOL
+# 1. USER SETTINGS FOR SYMBOL
 # ============================================================
 
 @api_view(["GET"])
@@ -81,15 +81,16 @@ def save_symbol_settings(request, symbol):
 
 
 # ============================================================
-# 2.  BOT START / STOP / STATUS FOR SYMBOL
+# 2. BOT START / STOP / STATUS — ASYNC
 # ============================================================
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def start_bot(request, symbol):
+async def start_bot(request, symbol):
     symbol = symbol.upper()
 
     try:
+        # Обновляем состояние в БД
         BotState.objects.update_or_create(
             user=request.user,
             symbol=symbol,
@@ -101,7 +102,8 @@ def start_bot(request, symbol):
             }
         )
 
-        trade_engine.start(symbol=symbol, user=request.user)
+        # <-- ВАЖНО: async запуск -->
+        await trade_engine.start(symbol, request.user)
 
         return Response({"success": True, "status": "started"})
 
@@ -112,7 +114,7 @@ def start_bot(request, symbol):
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def stop_bot(request, symbol):
+async def stop_bot(request, symbol):
     symbol = symbol.upper()
 
     try:
@@ -121,7 +123,8 @@ def stop_bot(request, symbol):
             symbol=symbol
         ).update(is_active=False, last_update=timezone.now())
 
-        trade_engine.stop(symbol=symbol, user=request.user)
+        # <-- ВАЖНО: async остановка -->
+        await trade_engine.stop(symbol, request.user)
 
         return Response({"success": True, "status": "stopped"})
 
