@@ -1,23 +1,25 @@
-# ===== apps/trading/models.py =====
+# apps/trading/models.py
 from django.db import models
 from django.conf import settings
 import uuid
 
+
 class Trade(models.Model):
-    """Trading positions"""
+    """Trading positions (в т.ч. для арбитража спреда)"""
+
     TRADE_TYPES = [
         ('arbitrage', 'Arbitrage'),
         ('margin', 'Margin'),
         ('spot', 'Spot'),
     ]
-    
+
     SIDES = [
         ('buy', 'Buy'),
         ('sell', 'Sell'),
         ('long', 'Long'),
         ('short', 'Short'),
     ]
-    
+
     STATUSES = [
         ('pending', 'Pending'),
         ('active', 'Active'),
@@ -25,27 +27,49 @@ class Trade(models.Model):
         ('failed', 'Failed'),
         ('cancelled', 'Cancelled'),
     ]
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='trades')
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='trades'
+    )
+
     trade_type = models.CharField(max_length=20, choices=TRADE_TYPES)
     symbol = models.CharField(max_length=20)
     side = models.CharField(max_length=10, choices=SIDES)
+
     entry_price = models.DecimalField(max_digits=20, decimal_places=8)
     exit_price = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
+
     amount = models.DecimalField(max_digits=20, decimal_places=8)
     filled_amount = models.DecimalField(max_digits=20, decimal_places=8, default=0)
+
     pnl = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
     pnl_percent = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
     fees = models.DecimalField(max_digits=20, decimal_places=8, default=0)
+
     status = models.CharField(max_length=20, choices=STATUSES, default='pending')
-    exchanges = models.JSONField(null=True, blank=True)  # For arbitrage
+
+    # Для арбитража: структура вида
+    # {
+    #   "exchange_1": {"id": "bybit", "side": "long", "entry": 100.1, ...},
+    #   "exchange_2": {"id": "gateio", "side": "short", "entry": 101.3, ...},
+    #   "entry_spread": 1.2,
+    #   "exit_spread": 0.4,
+    #   "funding_fees": {...},
+    #   "commissions": {...}
+    # }
+    exchanges = models.JSONField(null=True, blank=True)
+
     strategy = models.CharField(max_length=50, null=True, blank=True)
+
     opened_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+
     class Meta:
         db_table = 'trades'
         indexes = [
@@ -54,12 +78,14 @@ class Trade(models.Model):
             models.Index(fields=['symbol']),
         ]
         ordering = ['-opened_at']
-    
+
     def __str__(self):
         return f"{self.user.username} - {self.symbol} {self.side} - {self.status}"
 
+
 class BotLog(models.Model):
     """Bot activity logs"""
+
     LOG_TYPES = [
         ('info', 'Info'),
         ('success', 'Success'),
@@ -71,15 +97,25 @@ class BotLog(models.Model):
         ('transfer', 'Transfer'),
         ('profit', 'Profit'),
     ]
-    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='bot_logs')
-    trade = models.ForeignKey(Trade, on_delete=models.SET_NULL, null=True, blank=True, related_name='logs')
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='bot_logs'
+    )
+    trade = models.ForeignKey(
+        Trade,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='logs'
+    )
     log_type = models.CharField(max_length=20, choices=LOG_TYPES)
     message = models.TextField()
     details = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    
+
     class Meta:
         db_table = 'bot_logs'
         indexes = [
@@ -87,17 +123,18 @@ class BotLog(models.Model):
             models.Index(fields=['log_type']),
         ]
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.user.username} - {self.log_type} - {self.created_at}"
 
-# ===== NEW MODELS BELOW =====
+
+# ===== SPREAD BOT MODELS =====
 
 class UserSymbolSettings(models.Model):
     """
     Персональные настройки для каждой монеты:
     - биржи
-    - направление (LONG/SHORT)
+    - направление (LONG / SHORT spread)
     - спреды
     - объемы
     - ограничения
@@ -105,41 +142,49 @@ class UserSymbolSettings(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='symbol_settings'
     )
 
-    symbol = models.CharField(max_length=30)  # BTC, ETH, BEAT…
+    symbol = models.CharField(max_length=30)  # BTC, ETH...
 
     # Биржи
     exchange_1 = models.CharField(max_length=50)
     exchange_2 = models.CharField(max_length=50)
 
-    # LONG / SHORT
-    side = models.CharField(max_length=10, choices=[
-        ('long', 'Long'),
-        ('short', 'Short')
-    ])
+    # LONG / SHORT (именно в верхнем регистре — под trade_engine)
+    side = models.CharField(
+        max_length=10,
+        choices=[
+            ('LONG', 'Long'),
+            ('SHORT', 'Short'),
+        ]
+    )
 
-    # Спреды для открытия/закрытия
+    # Спреды для открытия/закрытия (в %)
     open_spread = models.FloatField(default=0.0)
     close_spread = models.FloatField(default=0.0)
 
     # Объемы ордеров
-    order_size = models.FloatField(default=0.0)   # в монетах
+    # order_size — в монетах
+    order_size = models.FloatField(default=0.0)
+    # order_size_usdt — в USDT (для удобства смены режима)
+    order_size_usdt = models.FloatField(default=0.0)
+
+    # Максимальное количество "ног" (пара позиций)
     max_orders = models.IntegerField(default=0)
 
     # Stop-флаги
     force_stop = models.BooleanField(default=False)
     total_stop = models.BooleanField(default=False)
 
-    # Количество тиков графика
+    # Количество тиков на графике
     open_ticks = models.IntegerField(default=0)
     close_ticks = models.IntegerField(default=0)
 
-    # Автоматические поля
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -160,6 +205,7 @@ class BotState(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -175,6 +221,11 @@ class BotState(models.Model):
     started_at = models.DateTimeField(null=True, blank=True)
 
     # Биржевые данные (обновляются в реальном времени)
+    # trade_engine кладёт сюда:
+    # - bid/ask/mark по обеим биржам
+    # - funding rates
+    # - ticks (open/close/real)
+    # - pnl, pnl_percent, realized_pnl и т.п.
     data = models.JSONField(default=dict, blank=True)
 
     # последняя активность
@@ -189,4 +240,3 @@ class BotState(models.Model):
 
     def __str__(self):
         return f"{self.user.username} – {self.symbol} bot state"
-
