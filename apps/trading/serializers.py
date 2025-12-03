@@ -1,14 +1,15 @@
-# ===== apps/trading/serializers.py =====
+# apps/trading/serializers.py
 from rest_framework import serializers
 from .models import (
     Trade,
     BotLog,
     UserSymbolSettings,
-    BotState
+    BotState,
 )
 
+
 # ============================================================
-# 1.  USER SYMBOL SETTINGS (Карточка настроек монеты)
+# 1. USER SYMBOL SETTINGS (карточка настроек монеты)
 # ============================================================
 
 class UserSymbolSettingsSerializer(serializers.ModelSerializer):
@@ -16,6 +17,7 @@ class UserSymbolSettingsSerializer(serializers.ModelSerializer):
     Настройки, которые пользователь вводит в карточке для конкретной монеты.
     Хранятся в таблице UserSymbolSettings.
     """
+
     class Meta:
         model = UserSymbolSettings
         fields = [
@@ -40,13 +42,14 @@ class UserSymbolSettingsSerializer(serializers.ModelSerializer):
 
 
 # ============================================================
-# 2.  BOT STATE (реальное состояние бота)
+# 2. BOT STATE (реальное состояние бота)
 # ============================================================
 
 class BotStateSerializer(serializers.ModelSerializer):
     """
     Статус бота, его прогресс, состояние торговли в реальном времени.
     """
+
     class Meta:
         model = BotState
         fields = [
@@ -59,7 +62,7 @@ class BotStateSerializer(serializers.ModelSerializer):
 
 
 # ============================================================
-# 3.  FULL STATE FOR FRONTEND (settings + bot state)
+# 3. FULL STATE FOR FRONTEND (settings + bot state)
 # ============================================================
 
 class FullSymbolStateSerializer(serializers.Serializer):
@@ -118,7 +121,14 @@ class BotLogSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = BotLog
-        fields = ["id", "time", "type", "log_type", "message", "created_at"]
+        fields = [
+            "id",
+            "time",
+            "type",
+            "log_type",
+            "message",
+            "created_at",
+        ]
 
     def get_time(self, obj):
         return obj.created_at.strftime("%H:%M:%S")
@@ -126,7 +136,6 @@ class BotLogSerializer(serializers.ModelSerializer):
 
 # ============================================================
 # 6. Универсальный сериализатор для сохранения параметров бота
-#    (если понадобится)
 # ============================================================
 
 class BotControlParamsSerializer(serializers.Serializer):
