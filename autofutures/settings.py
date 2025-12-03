@@ -72,8 +72,8 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': os.getenv('MYSQL_DATABASE', 'autofutures'),
-        'USER': os.getenv('MYSQL_USER', 'autofutures'),
-        'PASSWORD': os.getenv('MYSQL_PASSWORD', 'autofutures123'),
+        'USER': os.getenv('MYSQL_USER', 'autofutures_user'),
+        'PASSWORD': os.getenv('MYSQL_PASSWORD', 'Hokage123@'),
         'HOST': os.getenv('DB_HOST', 'localhost'),
         'PORT': os.getenv('DB_PORT', '3306'),
         'OPTIONS': {
