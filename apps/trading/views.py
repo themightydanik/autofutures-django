@@ -7,7 +7,6 @@ from rest_framework.response import Response
 from django.db import transaction
 from django.utils import timezone
 
-import asyncio
 import logging
 
 from .models import (
@@ -54,9 +53,6 @@ def get_symbol_settings(request, symbol):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def save_symbol_settings(request, symbol):
-    """
-    Сохраняем настройки карточки монеты через сериализатор.
-    """
     symbol = symbol.upper()
 
     serializer = UserSymbolSettingsSerializer(
@@ -94,8 +90,7 @@ def start_bot(request, symbol):
     symbol = symbol.upper()
 
     try:
-        # mark bot active
-        bot, _ = BotState.objects.update_or_create(
+        BotState.objects.update_or_create(
             user=request.user,
             symbol=symbol,
             defaults={
@@ -106,10 +101,7 @@ def start_bot(request, symbol):
             }
         )
 
-        # launch engine task
-        asyncio.get_event_loop().create_task(
-            trade_engine.start(symbol=symbol, user=request.user)
-        )
+        trade_engine.start(symbol=symbol, user=request.user)
 
         return Response({"success": True, "status": "started"})
 
@@ -125,12 +117,11 @@ def stop_bot(request, symbol):
 
     try:
         BotState.objects.filter(
-            user=request.user, symbol=symbol
+            user=request.user,
+            symbol=symbol
         ).update(is_active=False, last_update=timezone.now())
 
-        asyncio.get_event_loop().create_task(
-            trade_engine.stop(symbol=symbol, user=request.user)
-        )
+        trade_engine.stop(symbol=symbol, user=request.user)
 
         return Response({"success": True, "status": "stopped"})
 
@@ -170,7 +161,10 @@ def get_bot_state(request, symbol):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_active_trades(request):
-    trades = Trade.objects.filter(user=request.user, status="active")
+    trades = Trade.objects.filter(
+        user=request.user,
+        status="active"
+    ).order_by("-opened_at")
     return Response(TradeSerializer(trades, many=True).data)
 
 
@@ -178,7 +172,10 @@ def get_active_trades(request):
 @permission_classes([IsAuthenticated])
 def get_trade_history(request):
     limit = int(request.query_params.get("limit", 100))
-    trades = Trade.objects.filter(user=request.user, status="completed")[:limit]
+    trades = Trade.objects.filter(
+        user=request.user,
+        status="completed"
+    ).order_by("-closed_at")[:limit]
     return Response(TradeSerializer(trades, many=True).data)
 
 
@@ -186,5 +183,5 @@ def get_trade_history(request):
 @permission_classes([IsAuthenticated])
 def get_bot_logs(request):
     limit = int(request.query_params.get("limit", 50))
-    logs = BotLog.objects.filter(user=request.user)[:limit]
+    logs = BotLog.objects.filter(user=request.user).order_by("-created_at")[:limit]
     return Response({"logs": BotLogSerializer(logs, many=True).data})
