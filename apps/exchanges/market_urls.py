@@ -11,13 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 def run_async(coro):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return asyncio.run(coro)
-    except RuntimeError:
-        pass
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -27,7 +20,7 @@ def run_async(coro):
 
 
 # ======================================================
-# SYMBOL SEARCH (autocomplete)
+# SYMBOL SEARCH
 # ======================================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -47,15 +40,15 @@ def search_symbols(request):
         )
         return Response(results)
 
-    except Exception as e:
+    except Exception:
         logger.exception("Symbol search failed")
-        return Response([])
+        return Response([], status=500)
 
 
 # ======================================================
 # PRICE
 # ======================================================
-@api_view(['GET'])
+@api_view(["GET"])
 def get_price(request, exchange_id, symbol):
     price = run_async(
         exchange_service.get_ticker_price(exchange_id, symbol)
@@ -70,10 +63,10 @@ def get_price(request, exchange_id, symbol):
 # ======================================================
 # PRICE HISTORY
 # ======================================================
-@api_view(['GET'])
+@api_view(["GET"])
 def get_price_history(request, symbol):
-    interval = request.query_params.get('interval', '1m')
-    limit = int(request.query_params.get('limit', 100))
+    interval = request.query_params.get("interval", "1m")
+    limit = int(request.query_params.get("limit", 100))
 
     history = run_async(
         exchange_service.get_price_history(symbol, interval, limit)
@@ -84,9 +77,9 @@ def get_price_history(request, symbol):
 # ======================================================
 # TOP COINS
 # ======================================================
-@api_view(['GET'])
+@api_view(["GET"])
 def get_top_coins(request):
-    limit = int(request.query_params.get('limit', 10))
+    limit = int(request.query_params.get("limit", 10))
     coins = run_async(
         exchange_service.get_top_coins(limit)
     )
