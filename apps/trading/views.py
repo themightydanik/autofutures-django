@@ -1,164 +1,197 @@
 # ===== apps/trading/views.py =====
-from rest_framework import status
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status
 
-from django.db import transaction
 from django.utils import timezone
+from django.db import transaction
 
 import logging
 
-from .models import (
-    Trade,
-    BotLog,
-    UserSymbolSettings,
-    BotState
-)
-
-from .serializers import (
-    TradeSerializer,
-    BotLogSerializer,
-    UserSymbolSettingsSerializer,
-    FullSymbolStateSerializer,
-)
-
+from .models import Trade, BotLog, UserSymbolSettings, BotState
+from .serializers import TradeSerializer, BotLogSerializer
 from .trade_engine import trade_engine
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 1. USER SETTINGS FOR SYMBOL
+# SYMBOL FULL STATE (MAIN ENDPOINT FOR DASHBOARD)
 # ============================================================
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def get_symbol_settings(request, symbol):
-    symbol = symbol.upper()
+def get_symbol_state(request, symbol):
+    try:
+        symbol = symbol.upper()
+        user = request.user
 
-    settings = UserSymbolSettings.objects.filter(
-        user=request.user, symbol=symbol
-    ).first()
-
-    if not settings:
-        return Response(
-            {"symbol": symbol, "message": "No settings defined yet"},
-            status=status.HTTP_204_NO_CONTENT
+        settings, _ = UserSymbolSettings.objects.get_or_create(
+            user=user,
+            symbol=symbol,
+            defaults={
+                "exchange_1": "bybit",
+                "exchange_2": "gateio",
+                "side": "LONG",
+                "open_spread": 0.2,
+                "close_spread": 0.05,
+                "order_size": 0.0,
+                "order_size_usdt": 10.0,
+                "max_orders": 1,
+                "open_ticks": 0,
+                "close_ticks": 0,
+                "force_stop": False,
+                "total_stop": False,
+            }
         )
 
-    return Response(UserSymbolSettingsSerializer(settings).data)
+        bot_state, _ = BotState.objects.get_or_create(
+            user=user,
+            symbol=symbol,
+            defaults={
+                "is_active": False,
+                "data": {},
+                "last_update": timezone.now(),
+            }
+        )
 
+        return Response({
+            "symbol": symbol,
+            "is_active": bot_state.is_active,
+            "started_at": bot_state.started_at,
+            "settings": {
+                "side": settings.side,
+                "exchange_1": settings.exchange_1,
+                "exchange_2": settings.exchange_2,
+                "open_spread": settings.open_spread,
+                "close_spread": settings.close_spread,
+                "order_size": settings.order_size,
+                "order_size_usdt": settings.order_size_usdt,
+                "max_orders": settings.max_orders,
+                "open_ticks": settings.open_ticks,
+                "close_ticks": settings.close_ticks,
+                "force_stop": settings.force_stop,
+                "total_stop": settings.total_stop,
+            },
+            "state": bot_state.data or {},
+        })
+
+    except Exception as e:
+        logger.exception("get_symbol_state failed")
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+# ============================================================
+# SAVE SYMBOL SETTINGS
+# ============================================================
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def save_symbol_settings(request, symbol):
     symbol = symbol.upper()
-
-    serializer = UserSymbolSettingsSerializer(
-        data=request.data,
-        partial=True
-    )
-
-    if not serializer.is_valid():
-        return Response(serializer.errors, status=400)
-
-    validated = serializer.validated_data
+    user = request.user
 
     try:
         with transaction.atomic():
-            UserSymbolSettings.objects.update_or_create(
-                user=request.user,
-                symbol=symbol,
-                defaults=validated
+            settings, _ = UserSymbolSettings.objects.get_or_create(
+                user=user,
+                symbol=symbol
             )
+
+            allowed_fields = {
+                "exchange_1",
+                "exchange_2",
+                "side",
+                "open_spread",
+                "close_spread",
+                "order_size",
+                "order_size_usdt",
+                "max_orders",
+                "open_ticks",
+                "close_ticks",
+                "force_stop",
+                "total_stop",
+            }
+
+            for field, value in request.data.items():
+                if field in allowed_fields:
+                    setattr(settings, field, value)
+
+            settings.save()
 
         return Response({"success": True})
 
     except Exception as e:
-        logger.error(f"Error saving symbol settings: {e}")
-        return Response({"detail": str(e)}, status=400)
+        logger.exception("Save settings failed")
+        return Response({"error": str(e)}, status=400)
 
 
 # ============================================================
-# 2. BOT START / STOP / STATUS — ASYNC
+# START BOT
 # ============================================================
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-async def start_bot(request, symbol):
+def start_bot(request, symbol):
     symbol = symbol.upper()
+    user = request.user
 
     try:
-        # Обновляем состояние в БД
         BotState.objects.update_or_create(
-            user=request.user,
+            user=user,
             symbol=symbol,
             defaults={
                 "is_active": True,
                 "started_at": timezone.now(),
                 "last_update": timezone.now(),
-                "data": {}
+                "data": {},
             }
         )
 
-        # <-- ВАЖНО: async запуск -->
-        await trade_engine.start(symbol, request.user)
+        trade_engine.start_background(symbol, user.id)
 
-        return Response({"success": True, "status": "started"})
-
-    except Exception as e:
-        logger.error(f"Bot start failed: {e}")
-        return Response({"detail": str(e)}, status=400)
-
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-async def stop_bot(request, symbol):
-    symbol = symbol.upper()
-
-    try:
-        BotState.objects.filter(
-            user=request.user,
-            symbol=symbol
-        ).update(is_active=False, last_update=timezone.now())
-
-        # <-- ВАЖНО: async остановка -->
-        await trade_engine.stop(symbol, request.user)
-
-        return Response({"success": True, "status": "stopped"})
+        return Response({"success": True})
 
     except Exception as e:
-        logger.error(f"Bot stop failed: {e}")
-        return Response({"detail": str(e)}, status=400)
-
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def get_bot_state(request, symbol):
-    symbol = symbol.upper()
-
-    settings = UserSymbolSettings.objects.filter(
-        user=request.user, symbol=symbol
-    ).first()
-
-    if not settings:
-        return Response({"detail": "No settings found"}, status=404)
-
-    bot_state = BotState.objects.filter(
-        user=request.user, symbol=symbol
-    ).first()
-
-    combined = {
-        "settings": settings,
-        "bot_state": bot_state
-    }
-
-    return Response(FullSymbolStateSerializer(combined).data)
+        logger.exception("Bot start failed")
+        return Response({"error": str(e)}, status=400)
 
 
 # ============================================================
-# 3. TRADES AND LOGS
+# STOP BOT
+# ============================================================
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def stop_bot(request, symbol):
+    symbol = symbol.upper()
+    user = request.user
+
+    try:
+        BotState.objects.filter(
+            user=user,
+            symbol=symbol
+        ).update(
+            is_active=False,
+            last_update=timezone.now()
+        )
+
+        trade_engine.stop_background(symbol, user.id)
+
+        return Response({"success": True})
+
+    except Exception as e:
+        logger.exception("Bot stop failed")
+        return Response({"error": str(e)}, status=400)
+
+
+# ============================================================
+# TRADES
 # ============================================================
 
 @api_view(["GET"])
@@ -168,6 +201,7 @@ def get_active_trades(request):
         user=request.user,
         status="active"
     ).order_by("-opened_at")
+
     return Response(TradeSerializer(trades, many=True).data)
 
 
@@ -175,16 +209,27 @@ def get_active_trades(request):
 @permission_classes([IsAuthenticated])
 def get_trade_history(request):
     limit = int(request.query_params.get("limit", 100))
+
     trades = Trade.objects.filter(
-        user=request.user,
-        status="completed"
-    ).order_by("-closed_at")[:limit]
+        user=request.user
+    ).order_by("-opened_at")[:limit]
+
     return Response(TradeSerializer(trades, many=True).data)
 
+
+# ============================================================
+# LOGS
+# ============================================================
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_bot_logs(request):
     limit = int(request.query_params.get("limit", 50))
-    logs = BotLog.objects.filter(user=request.user).order_by("-created_at")[:limit]
-    return Response({"logs": BotLogSerializer(logs, many=True).data})
+
+    logs = BotLog.objects.filter(
+        user=request.user
+    ).order_by("-created_at")[:limit]
+
+    return Response({
+        "logs": BotLogSerializer(logs, many=True).data
+    })

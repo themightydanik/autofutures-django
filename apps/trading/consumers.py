@@ -19,8 +19,13 @@ class TradingConsumer(AsyncWebsocketConsumer):
 
         await self.send(text_data=json.dumps({
             "type": "connection",
-            "message": "WebSocket connected"
-        }))
+           "message": "WebSocket connected"
+       }))
+
+  #   async def connect(self):
+ #    print("🔥 WS CONNECT CALLED", self.scope)
+  #   await self.accept()
+
 
     async def disconnect(self, close_code):
         await self.channel_layer.group_discard(

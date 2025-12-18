@@ -9,8 +9,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this-in-production')
-DEBUG = os.getenv('DEBUG', 'False') == 'True'
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+DEBUG = True
+
+ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
+    "103.13.208.11",
+]
 
 # Application definition
 INSTALLED_APPS = [
@@ -28,7 +33,7 @@ INSTALLED_APPS = [
     'channels',
     
     # Our apps
-    'apps.users',
+    'apps.users.apps.UsersConfig',
     'apps.exchanges',
     'apps.trading',
     'apps.analytics',
@@ -72,8 +77,8 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': os.getenv('MYSQL_DATABASE', 'autofutures'),
-        'USER': os.getenv('MYSQL_USER', 'autofutures'),
-        'PASSWORD': os.getenv('MYSQL_PASSWORD', 'autofutures123'),
+        'USER': os.getenv('MYSQL_USER', 'autofutures_user'),
+        'PASSWORD': os.getenv('MYSQL_PASSWORD', 'Hokage123@'),
         'HOST': os.getenv('DB_HOST', 'localhost'),
         'PORT': os.getenv('DB_PORT', '3306'),
         'OPTIONS': {

@@ -1,139 +1,144 @@
-# ===== apps/exchanges/exchange_service.py =====
-import ccxt
-import asyncio
-from typing import Dict, List, Optional
-from datetime import datetime
-import logging
+# ===== apps/exchanges/views.py =====
+
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from django.utils import timezone
+
+from .models import ExchangeConnection
+from .exchange_service import exchange_service
 from .encryption import encryption_service
 
-logger = logging.getLogger(__name__)
 
-class ExchangeService:
-    """Service for working with crypto exchanges"""
-    
-    SUPPORTED_EXCHANGES = {
-        'binance': ccxt.binance,
-        'gateio': ccxt.gateio,
-        'bybit': ccxt.bybit,
-    }
-    
-    def __init__(self):
-        self.exchanges = {}  # {user_id: {exchange_id: exchange}}
-    
-    async def connect_exchange(self, user_id: str, exchange_id: str, api_key: str, secret_key: str, passphrase: str = None):
-        """Connect to exchange with API keys"""
-        try:
-            if exchange_id not in self.SUPPORTED_EXCHANGES:
-                raise ValueError(f"Exchange {exchange_id} not supported")
-            
-            exchange_class = self.SUPPORTED_EXCHANGES[exchange_id]
-            exchange = exchange_class({
-                'apiKey': api_key,
-                'secret': secret_key,
-                'password': passphrase if passphrase else None,
-                'enableRateLimit': True,
-                'options': {'defaultType': 'spot'}
-            })
-            
-            # Test connection
-            await exchange.load_markets()
-            
-            # Save connection
-            if user_id not in self.exchanges:
-                self.exchanges[user_id] = {}
-            self.exchanges[user_id][exchange_id] = exchange
-            
-            logger.info(f"Connected to {exchange_id} for user {user_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to {exchange_id}: {str(e)}")
-            raise Exception(f"Connection failed: {str(e)}")
-    
-    async def get_balance(self, user_id: str, exchange_id: str) -> Dict:
-        """Get balance on exchange"""
-        try:
-            exchange = self._get_exchange(user_id, exchange_id)
-            balance = await exchange.fetch_balance()
-            
-            usdt_balance = balance.get('USDT', {})
-            return {
-                'exchange': exchange_id,
-                'currency': 'USDT',
-                'free': float(usdt_balance.get('free', 0)),
-                'locked': float(usdt_balance.get('used', 0)),
-                'total': float(usdt_balance.get('total', 0)),
-                'updated_at': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Error fetching balance: {str(e)}")
-            return {'exchange': exchange_id, 'currency': 'USDT', 'free': 0, 'locked': 0, 'total': 0}
-    
-    async def get_ticker_price(self, exchange_id: str, symbol: str) -> float:
-        """Get current price"""
-        try:
-            exchange_class = self.SUPPORTED_EXCHANGES[exchange_id]
-            exchange = exchange_class({'enableRateLimit': True})
-            ticker = await exchange.fetch_ticker(f"{symbol}/USDT")
-            return ticker['last']
-        except Exception as e:
-            logger.error(f"Error fetching price: {str(e)}")
-            raise
-    
-    async def get_price_history(self, symbol: str, interval: str = '1m', limit: int = 100, exchange_id: str = 'binance') -> List[Dict]:
-        """Get price history for chart"""
-        try:
-            exchange = ccxt.binance({'enableRateLimit': True})
-            ohlcv = await exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe=interval, limit=limit)
-            
-            history = []
-            for candle in ohlcv:
-                history.append({
-                    'timestamp': candle[0],
-                    'time': datetime.fromtimestamp(candle[0] / 1000).strftime('%H:%M'),
-                    'open': candle[1],
-                    'high': candle[2],
-                    'low': candle[3],
-                    'close': candle[4],
-                    'price': candle[4],
-                    'volume': candle[5]
-                })
-            
-            return history
-        except Exception as e:
-            logger.error(f"Error fetching history: {str(e)}")
-            return []
-    
-    async def get_top_coins(self, limit: int = 10) -> List[Dict]:
-        """Get top coins by volume"""
-        try:
-            exchange = ccxt.binance({'enableRateLimit': True})
-            tickers = await exchange.fetch_tickers()
-            
-            usdt_pairs = {k: v for k, v in tickers.items() if '/USDT' in k and ':USDT' not in k}
-            sorted_pairs = sorted(usdt_pairs.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)[:limit]
-            
-            coins = []
-            for symbol, ticker in sorted_pairs:
-                coin_symbol = symbol.split('/')[0]
-                coins.append({
-                    'symbol': coin_symbol,
-                    'name': coin_symbol,
-                    'price': ticker.get('last', 0),
-                    'change': ticker.get('percentage', 0),
-                    'volume': ticker.get('quoteVolume', 0)
-                })
-            
-            return coins
-        except Exception as e:
-            logger.error(f"Error fetching top coins: {str(e)}")
-            return []
-    
-    def _get_exchange(self, user_id: str, exchange_id: str):
-        """Get exchange instance"""
-        if user_id not in self.exchanges or exchange_id not in self.exchanges[user_id]:
-            raise ValueError(f"Exchange {exchange_id} not connected")
-        return self.exchanges[user_id][exchange_id]
+# ============================================================
+# SUPPORTED EXCHANGES
+# ============================================================
 
-# Global instance
-exchange_service = ExchangeService()
+SUPPORTED = [
+    {"id": "binance", "name": "Binance", "requires_passphrase": False},
+    {"id": "bybit", "name": "Bybit", "requires_passphrase": False},
+    {"id": "bitget", "name": "Bitget", "requires_passphrase": True},
+    {"id": "gateio", "name": "Gate.io", "requires_passphrase": False},
+    {"id": "mexc", "name": "MEXC", "requires_passphrase": False},
+    {"id": "bingx", "name": "BingX", "requires_passphrase": False},
+]
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_supported_exchanges(request):
+    return Response({"exchanges": SUPPORTED})
+
+
+# ============================================================
+# LIST CONNECTED EXCHANGES (used by TradingContext & Settings)
+# ============================================================
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def manage_exchanges(request):
+    user = request.user
+
+    conns = ExchangeConnection.objects.filter(user=user, is_active=True)
+
+    connections = [
+        {
+            "exchange_id": c.exchange_id,
+            "id": c.exchange_id,
+            "connected": True,
+            "connected_at": c.created_at,
+        }
+        for c in conns
+    ]
+
+    return Response({"connections": connections})
+
+
+# ============================================================
+# CONNECT EXCHANGE
+# ============================================================
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def connect_exchange(request):
+    user = request.user
+
+    exchange_id = request.data.get("exchange_id")
+    api_key = request.data.get("api_key")
+    secret_key = request.data.get("secret_key")
+    passphrase = request.data.get("passphrase", "")
+
+    if not exchange_id or not api_key or not secret_key:
+        return Response(
+            {"success": False, "error": "Missing credentials"},
+            status=400,
+        )
+
+    ExchangeConnection.objects.update_or_create(
+        user=user,
+        exchange_id=exchange_id,
+        defaults={
+            "api_key_encrypted": encryption_service.encrypt(api_key),
+            "secret_key_encrypted": encryption_service.encrypt(secret_key),
+            "passphrase_encrypted": encryption_service.encrypt(passphrase)
+            if passphrase
+            else None,
+            "is_active": True,
+            "last_sync": timezone.now(),
+        },
+    )
+
+    # Warm-up CCXT client (try to validate keys)
+    try:
+        exchange_service._get_private_client(user.id, exchange_id)
+    except Exception as e:
+        return Response({"success": False, "error": str(e)}, status=400)
+
+    return Response({"success": True})
+
+
+# ============================================================
+# DISCONNECT EXCHANGE
+# ============================================================
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def disconnect_exchange(request):
+    user = request.user
+    exchange_id = request.data.get("exchange_id")
+
+    if not exchange_id:
+        return Response({"error": "exchange_id required"}, status=400)
+
+    ExchangeConnection.objects.filter(
+        user=user, exchange_id=exchange_id
+    ).update(is_active=False)
+
+    # Clear cached client
+    if user.id in exchange_service.private_connections:
+        exchange_service.private_connections[user.id].pop(exchange_id, None)
+
+    return Response({"success": True})
+
+
+# ============================================================
+# ALL BALANCES (used by TradingContext)
+# ============================================================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_all_balances(request):
+    user = request.user
+    result = {}
+
+    conns = ExchangeConnection.objects.filter(user=user, is_active=True)
+
+    for conn in conns:
+        try:
+            bal = exchange_service.get_balance_sync(user.id, conn.exchange_id)
+            result[conn.exchange_id] = bal
+        except Exception as e:
+            result[conn.exchange_id] = {"error": str(e)}
+
+    return Response(result)

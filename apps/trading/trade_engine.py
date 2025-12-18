@@ -24,8 +24,9 @@ except ImportError:
 # Маппинг наших id бирж → id в ccxt
 CCXT_EXCHANGE_IDS = {
     "bybit": "bybit",
+    "binance": "binanceusdm",
     "mexc": "mexc",      # возможно "mexc3" – при необходимости поменяешь
-    "gateio": "gateio",
+    "gateio": "gate",
     "bingx": "bingx",
     "bitget": "bitget",
 }
@@ -880,6 +881,34 @@ class TradeEngine:
                 "data": data,
             }
         )
+
+    # ------------------------------------------------------
+    # SYNC wrappers (для вызова из Django views)
+    # ------------------------------------------------------
+    def start_background(self, symbol, user_id):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            logger.error(f"User not found: {user_id}")
+            return
+
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.start(symbol, user))
+
+    def stop_background(self, symbol, user_id):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            logger.error(f"User not found: {user_id}")
+            return
+
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.stop(symbol, user))
+
 
 
 # Синглтон
