@@ -1,24 +1,38 @@
-# apps/exchanges/market_urls.py
-
 from django.urls import path
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+
 from .exchange_service import exchange_service
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            return asyncio.run(coro)
+    except RuntimeError:
+        pass
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ======================================================
-# SYMBOL SEARCH (autocomplete for terminal)
+# SYMBOL SEARCH (autocomplete)
 # ======================================================
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def search_symbols(request):
-    q = request.query_params.get("q", "").upper()
+    q = request.query_params.get("q", "").upper().strip()
 
     if len(q) < 2:
         return Response([])
@@ -27,14 +41,15 @@ def search_symbols(request):
         results = run_async(
             exchange_service.search_symbols(
                 query=q,
-                exchanges=["binance", "bybit", "bitget", "gateio", "mexc", "bingx"],
+                exchanges=["binance", "bybit", "gateio", "mexc", "bingx"],
                 limit=20
             )
         )
         return Response(results)
 
     except Exception as e:
-        return Response({"detail": str(e)}, status=500)
+        logger.exception("Symbol search failed")
+        return Response([])
 
 
 # ======================================================
