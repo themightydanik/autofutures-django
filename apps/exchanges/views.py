@@ -142,3 +142,28 @@ def get_all_balances(request):
             result[conn.exchange_id] = {"error": str(e)}
 
     return Response(result)
+
+# ============================================================
+# SYMBOL SEARCH (used by SymbolSelector)
+# ============================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def search_symbols(request):
+    query = request.query_params.get("q", "").strip()
+
+    if not query or len(query) < 1:
+        return Response([])
+
+    # 🔥 ВАЖНО: исключаем bitget (V1 API умер)
+    exchanges = ["binance", "bybit", "gateio", "mexc", "bingx"]
+
+    try:
+        results = asyncio.run(
+            exchange_service.search_symbols(query, exchanges)
+        )
+        return Response(results)
+
+    except Exception as e:
+        logger.exception("Symbol search failed")
+        return Response([], status=200)
+
