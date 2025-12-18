@@ -1,19 +1,15 @@
-# ===== apps/exchanges/exchange_service.py =====
-
 import ccxt
 import asyncio
 import logging
-from datetime import datetime
-from typing import Dict, Optional, List
+from typing import List
 
 from .encryption import encryption_service
 from .models import ExchangeConnection
 
 logger = logging.getLogger(__name__)
 
-
 # ================================================================
-# МАППИНГ БИРЖ
+# EXCHANGE MAP
 # ================================================================
 EXCHANGE_CCXT_MAP = {
     "bybit": "bybit",
@@ -25,20 +21,15 @@ EXCHANGE_CCXT_MAP = {
 }
 
 
-# ================================================================
-# Exchange Service
-# ================================================================
 class ExchangeService:
-
     def __init__(self):
         # user_id → {exchange_id → ccxt_instance}
         self.private_connections = {}
-
-        # exchange_id → public ccxt instance (NO API KEYS)
+        # exchange_id → public ccxt instance
         self.public_clients = {}
 
     # ============================================================
-    # PUBLIC CLIENT (market data, symbols, prices)
+    # PUBLIC CLIENT
     # ============================================================
     def _get_public_client(self, exchange_id: str):
         exchange_id = exchange_id.lower()
@@ -54,16 +45,14 @@ class ExchangeService:
 
         client = client_class({
             "enableRateLimit": True,
-            "options": {
-                "defaultType": "future",
-            }
+            "options": {"defaultType": "future"},
         })
 
         self.public_clients[exchange_id] = client
         return client
 
     # ============================================================
-    # PRIVATE CLIENT (trading)
+    # PRIVATE CLIENT
     # ============================================================
     def _get_private_client(self, user_id: int, exchange_id: str):
         exchange_id = exchange_id.lower()
@@ -77,11 +66,11 @@ class ExchangeService:
         if exchange_id in self.private_connections[user_id]:
             return self.private_connections[user_id][exchange_id]
 
-        conn = (
-            ExchangeConnection.objects
-            .filter(user_id=user_id, exchange_id=exchange_id, is_active=True)
-            .first()
-        )
+        conn = ExchangeConnection.objects.filter(
+            user_id=user_id,
+            exchange_id=exchange_id,
+            is_active=True
+        ).first()
 
         if not conn:
             raise ValueError(f"No API keys stored for {exchange_id}")
@@ -101,31 +90,31 @@ class ExchangeService:
             "secret": secret_key,
             "password": passphrase,
             "enableRateLimit": True,
-            "options": {
-                "defaultType": "future",
-            }
+            "options": {"defaultType": "future"},
         })
 
         self.private_connections[user_id][exchange_id] = client
         return client
 
     # ============================================================
-    # SYMBOL SEARCH (PUBLIC) - FIXED INDENTATION
+    # SYMBOL SEARCH (FIXED)
     # ============================================================
     async def search_symbols(self, query: str, exchanges: List[str], limit: int = 20):
-        """Search for symbols across multiple exchanges"""
         query = query.upper()
-        symbol_map = {}
+        results = {}
 
         for ex_id in exchanges:
             try:
                 client = self._get_public_client(ex_id)
+
                 markets = await asyncio.get_event_loop().run_in_executor(
                     None, client.load_markets
                 )
 
                 for symbol, market in markets.items():
-                    if not market.get("future"):
+
+                    # ✅ futures / swaps only
+                    if market.get("type") not in ("swap", "future"):
                         continue
 
                     if not symbol.endswith("/USDT"):
@@ -136,24 +125,24 @@ class ExchangeService:
                     if query not in base:
                         continue
 
-                    if base not in symbol_map:
-                        symbol_map[base] = {
+                    if base not in results:
+                        results[base] = {
                             "symbol": base,
                             "available_on": []
                         }
 
-                    symbol_map[base]["available_on"].append(ex_id)
+                    results[base]["available_on"].append(ex_id)
 
-                    if len(symbol_map) >= limit:
+                    if len(results) >= limit:
                         break
 
             except Exception as e:
                 logger.warning(f"Symbol search failed {ex_id}: {e}")
 
-        return list(symbol_map.values())[:limit]
+        return list(results.values())[:limit]
 
     # ============================================================
-    # PRICE (PUBLIC)
+    # PRICE
     # ============================================================
     async def get_ticker_price(self, exchange_id: str, symbol: str):
         client = self._get_public_client(exchange_id)
@@ -162,11 +151,10 @@ class ExchangeService:
         ticker = await asyncio.get_event_loop().run_in_executor(
             None, lambda: client.fetch_ticker(market_symbol)
         )
-
         return ticker.get("last")
 
     # ============================================================
-    # PRICE HISTORY (PUBLIC)
+    # PRICE HISTORY
     # ============================================================
     async def get_price_history(self, symbol: str, interval="1m", limit=100):
         client = self._get_public_client("binance")
@@ -190,7 +178,7 @@ class ExchangeService:
         ]
 
     # ============================================================
-    # TOP COINS (PUBLIC)
+    # TOP COINS
     # ============================================================
     async def get_top_coins(self, limit=10):
         client = self._get_public_client("binance")
@@ -200,9 +188,9 @@ class ExchangeService:
         )
 
         usdt_pairs = [
-            (symbol, data.get("quoteVolume", 0))
-            for symbol, data in tickers.items()
-            if symbol.endswith("/USDT")
+            (s, d.get("quoteVolume", 0))
+            for s, d in tickers.items()
+            if s.endswith("/USDT")
         ]
 
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
@@ -213,16 +201,15 @@ class ExchangeService:
         ]
 
     # ============================================================
-    # PRIVATE TRADING METHODS
+    # SYNC BALANCE
     # ============================================================
-    async def create_order(self, user_id, exchange_id, symbol, side, amount):
-        client = self._get_private_client(user_id, exchange_id)
-        market_symbol = f"{symbol}/USDT"
-
-        return await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: client.create_order(market_symbol, "market", side, amount)
-        )
+    def get_balance_sync(self, user_id, exchange_id):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(self.get_balance(user_id, exchange_id))
+        finally:
+            loop.close()
 
     async def get_balance(self, user_id, exchange_id):
         client = self._get_private_client(user_id, exchange_id)
@@ -238,18 +225,6 @@ class ExchangeService:
             "locked": float(usdt.get("used", 0)),
             "total": float(usdt.get("total", 0)),
         }
-
-    # ============================================================
-    # SYNC WRAPPERS (for views.py)
-    # ============================================================
-    def get_balance_sync(self, user_id, exchange_id):
-        """Synchronous wrapper for get_balance"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self.get_balance(user_id, exchange_id))
-        finally:
-            loop.close()
 
 
 # Singleton
