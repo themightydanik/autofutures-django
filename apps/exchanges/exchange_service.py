@@ -98,61 +98,77 @@ class ExchangeService:
         self.private_connections[user_id][exchange_id] = client
         return client
 
-    # ============================================================
-    # SYMBOL SEARCH (CORRECT & WORKING)
-    # ============================================================
-    async def search_symbols(self, query: str, exchanges: List[str], limit: int = 20):
-        query = query.upper()
-        results = {}
+# ============================================================
+# SYMBOL SEARCH (FINAL, SAFE, USDT-SWAP ONLY)
+# ============================================================
+async def search_symbols(self, query: str, exchanges: List[str], limit: int = 20):
+    query = query.upper().strip()
+    results = {}
 
-        for ex_id in exchanges:
-            try:
-                client = self._get_public_client(ex_id)
+    for ex_id in exchanges:
+        if ex_id not in EXCHANGE_CCXT_MAP:
+            continue
 
-                markets = await asyncio.get_event_loop().run_in_executor(
-                    None, client.load_markets
-                )
+        try:
+            client = self._get_public_client(ex_id)
 
-                for market in markets.values():
+            markets = await asyncio.get_event_loop().run_in_executor(
+                None, client.load_markets
+            )
 
-                    # ✅ только perpetual USDT swaps
-                    if not market.get("swap"):
-                        continue
+            for market in markets.values():
 
-                    if market.get("quote") != "USDT":
-                        continue
+                # ✅ only perpetual swaps
+                if not market.get("swap"):
+                    continue
 
-                    base = market.get("base")
-                    if not base or query not in base:
-                        continue
+                # ✅ only USDT quoted
+                if market.get("quote") != "USDT":
+                    continue
 
-                    if base not in results:
-                        results[base] = {
-                            "symbol": base,
-                            "available_on": []
-                        }
+                base = market.get("base")
+                if not base:
+                    continue
 
+                if query not in base:
+                    continue
+
+                if base not in results:
+                    results[base] = {
+                        "symbol": base,
+                        "available_on": []
+                    }
+
+                if ex_id not in results[base]["available_on"]:
                     results[base]["available_on"].append(ex_id)
 
-                    if len(results) >= limit:
-                        break
+                if len(results) >= limit:
+                    break
 
-            except Exception as e:
-                logger.warning(f"Symbol search failed {ex_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Symbol search failed {ex_id}: {e}")
 
-        return list(results.values())
+    return list(results.values())[:limit]
 
-    # ============================================================
-    # PRICE
-    # ============================================================
-    async def get_ticker_price(self, exchange_id: str, symbol: str):
-        client = self._get_public_client(exchange_id)
-        market_symbol = f"{symbol}/USDT"
 
-        ticker = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: client.fetch_ticker(market_symbol)
-        )
-        return ticker.get("last")
+# ============================================================
+# PRICE (SAFE)
+# ============================================================
+async def get_ticker_price(self, exchange_id: str, symbol: str):
+
+    # 🔒 safety: only BASE symbols allowed
+    if "/" in symbol or symbol.endswith("BTC"):
+        raise ValueError(f"Invalid symbol: {symbol}")
+
+    client = self._get_public_client(exchange_id)
+    market_symbol = f"{symbol}/USDT"
+
+    ticker = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: client.fetch_ticker(market_symbol)
+    )
+
+    return ticker.get("last")
+
 
     # ============================================================
     # PRICE HISTORY
