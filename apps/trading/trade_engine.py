@@ -61,6 +61,25 @@ class TradeEngine:
         # key: f"{user_id}:{exchange_id}" → ccxt instance
         self.ccxt_clients = {}
 
+            # =====================================================
+        # Dedicated background asyncio loop (REQUIRED for Django)
+        # =====================================================
+        import threading
+
+        self.loop = asyncio.new_event_loop()
+
+        def _run_loop(loop):
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        self.loop_thread = threading.Thread(
+            target=_run_loop,
+            args=(self.loop,),
+            daemon=True,
+        )
+        self.loop_thread.start()
+
+
     # ------------------------------------------------------
     # Вспомогательный ключ
     # ------------------------------------------------------
@@ -885,29 +904,41 @@ class TradeEngine:
     # ------------------------------------------------------
     # SYNC wrappers (для вызова из Django views)
     # ------------------------------------------------------
-    def start_background(self, symbol, user_id):
-        from django.contrib.auth import get_user_model
-        User = get_user_model()
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            logger.error(f"User not found: {user_id}")
-            return
+def start_background(self, symbol, user_id):
+    from django.contrib.auth import get_user_model
+    from asyncio import run_coroutine_threadsafe
 
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.start(symbol, user))
+    User = get_user_model()
 
-    def stop_background(self, symbol, user_id):
-        from django.contrib.auth import get_user_model
-        User = get_user_model()
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            logger.error(f"User not found: {user_id}")
-            return
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        logger.error(f"User not found: {user_id}")
+        return
 
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.stop(symbol, user))
+    run_coroutine_threadsafe(
+        self.start(symbol, user),
+        self.loop,
+    )
+
+
+def stop_background(self, symbol, user_id):
+    from django.contrib.auth import get_user_model
+    from asyncio import run_coroutine_threadsafe
+
+    User = get_user_model()
+
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        logger.error(f"User not found: {user_id}")
+        return
+
+    run_coroutine_threadsafe(
+        self.stop(symbol, user),
+        self.loop,
+    )
+
 
 
 
