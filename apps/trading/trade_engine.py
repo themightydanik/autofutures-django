@@ -61,7 +61,7 @@ class TradeEngine:
         # key: f"{user_id}:{exchange_id}" → ccxt instance
         self.ccxt_clients = {}
 
-            # =====================================================
+        # =====================================================
         # Dedicated background asyncio loop (REQUIRED for Django)
         # =====================================================
         import threading
@@ -904,40 +904,41 @@ class TradeEngine:
     # ------------------------------------------------------
     # SYNC wrappers (для вызова из Django views)
     # ------------------------------------------------------
-def start_background(self, symbol, user_id):
-    from django.contrib.auth import get_user_model
-    from asyncio import run_coroutine_threadsafe
+    def start_background(self, symbol, user_id):
+        from django.contrib.auth import get_user_model
+        from asyncio import run_coroutine_threadsafe
 
-    User = get_user_model()
+        User = get_user_model()
 
-    try:
-        user = User.objects.get(id=user_id)
-    except User.DoesNotExist:
-        logger.error(f"User not found: {user_id}")
-        return
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            logger.error(f"User not found: {user_id}")
+            return
 
-    run_coroutine_threadsafe(
-        self.start(symbol, user),
-        self.loop,
-    )
+        run_coroutine_threadsafe(
+            self.start(symbol, user),
+            self.loop,
+        )
 
 
-def stop_background(self, symbol, user_id):
-    from django.contrib.auth import get_user_model
-    from asyncio import run_coroutine_threadsafe
+    def stop_background(self, symbol, user_id):
+        from django.contrib.auth import get_user_model
+        from asyncio import run_coroutine_threadsafe
 
-    User = get_user_model()
+        User = get_user_model()
 
-    try:
-        user = User.objects.get(id=user_id)
-    except User.DoesNotExist:
-        logger.error(f"User not found: {user_id}")
-        return
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            logger.error(f"User not found: {user_id}")
+            return
 
-    run_coroutine_threadsafe(
-        self.stop(symbol, user),
-        self.loop,
-    )
+        run_coroutine_threadsafe(
+            self.stop(symbol, user),
+            self.loop,
+        )
+
 
 
 
