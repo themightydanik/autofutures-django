@@ -12,24 +12,22 @@ logger = logging.getLogger(__name__)
 # EXCHANGE MAP
 # ================================================================
 EXCHANGE_CCXT_MAP = {
+    "binance": "binanceusdm",   # USDT-margined perpetuals
     "bybit": "bybit",
-    "binance": "binanceusdm",   # futures USDM
-    "bitget": "bitget",
     "gateio": "gate",
     "mexc": "mexc",
     "bingx": "bingx",
+    # bitget временно убираем (V1 API deprecated)
 }
 
 
 class ExchangeService:
     def __init__(self):
-        # user_id → {exchange_id → ccxt_instance}
         self.private_connections = {}
-        # exchange_id → public ccxt instance
         self.public_clients = {}
 
     # ============================================================
-    # PUBLIC CLIENT
+    # PUBLIC CLIENT (market data)
     # ============================================================
     def _get_public_client(self, exchange_id: str):
         exchange_id = exchange_id.lower()
@@ -45,14 +43,16 @@ class ExchangeService:
 
         client = client_class({
             "enableRateLimit": True,
-            "options": {"defaultType": "future"},
+            "options": {
+                "defaultType": "swap",  # 🔥 ВАЖНО: perpetual futures
+            }
         })
 
         self.public_clients[exchange_id] = client
         return client
 
     # ============================================================
-    # PRIVATE CLIENT
+    # PRIVATE CLIENT (trading)
     # ============================================================
     def _get_private_client(self, user_id: int, exchange_id: str):
         exchange_id = exchange_id.lower()
@@ -90,14 +90,16 @@ class ExchangeService:
             "secret": secret_key,
             "password": passphrase,
             "enableRateLimit": True,
-            "options": {"defaultType": "future"},
+            "options": {
+                "defaultType": "swap",  # 🔥 тоже swap
+            }
         })
 
         self.private_connections[user_id][exchange_id] = client
         return client
 
     # ============================================================
-    # SYMBOL SEARCH (FIXED)
+    # SYMBOL SEARCH (CORRECT & WORKING)
     # ============================================================
     async def search_symbols(self, query: str, exchanges: List[str], limit: int = 20):
         query = query.upper()
@@ -111,18 +113,17 @@ class ExchangeService:
                     None, client.load_markets
                 )
 
-                for symbol, market in markets.items():
+                for market in markets.values():
 
-                    # ✅ futures / swaps only
-                    if market.get("type") not in ("swap", "future"):
+                    # ✅ только perpetual USDT swaps
+                    if not market.get("swap"):
                         continue
 
-                    if not symbol.endswith("/USDT"):
+                    if market.get("quote") != "USDT":
                         continue
 
-                    base = symbol.replace("/USDT", "")
-
-                    if query not in base:
+                    base = market.get("base")
+                    if not base or query not in base:
                         continue
 
                     if base not in results:
@@ -139,7 +140,7 @@ class ExchangeService:
             except Exception as e:
                 logger.warning(f"Symbol search failed {ex_id}: {e}")
 
-        return list(results.values())[:limit]
+        return list(results.values())
 
     # ============================================================
     # PRICE
@@ -162,7 +163,11 @@ class ExchangeService:
 
         ohlcv = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: client.fetch_ohlcv(market_symbol, timeframe=interval, limit=limit)
+            lambda: client.fetch_ohlcv(
+                market_symbol,
+                timeframe=interval,
+                limit=limit
+            )
         )
 
         return [
@@ -188,31 +193,34 @@ class ExchangeService:
         )
 
         usdt_pairs = [
-            (s, d.get("quoteVolume", 0))
-            for s, d in tickers.items()
-            if s.endswith("/USDT")
+            (symbol, data.get("quoteVolume", 0))
+            for symbol, data in tickers.items()
+            if data.get("swap") and symbol.endswith("USDT")
         ]
 
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
 
         return [
-            {"symbol": s.replace("/USDT", ""), "volume": v}
+            {"symbol": s.replace("USDT", ""), "volume": v}
             for s, v in usdt_pairs[:limit]
         ]
 
     # ============================================================
-    # SYNC BALANCE
+    # BALANCE (SYNC WRAPPER)
     # ============================================================
     def get_balance_sync(self, user_id, exchange_id):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(self.get_balance(user_id, exchange_id))
+            return loop.run_until_complete(
+                self.get_balance(user_id, exchange_id)
+            )
         finally:
             loop.close()
 
     async def get_balance(self, user_id, exchange_id):
         client = self._get_private_client(user_id, exchange_id)
+
         balance = await asyncio.get_event_loop().run_in_executor(
             None, client.fetch_balance
         )
@@ -227,5 +235,7 @@ class ExchangeService:
         }
 
 
-# Singleton
+# ============================================================
+# SINGLETON
+# ============================================================
 exchange_service = ExchangeService()
