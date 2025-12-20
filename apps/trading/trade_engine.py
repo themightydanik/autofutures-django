@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from django.utils import timezone
 from channels.layers import get_channel_layer
+from asgiref.sync import sync_to_async
 
 from .models import BotState, UserSymbolSettings, BotLog, Trade
 from apps.exchanges.models import ExchangeConnection
@@ -25,45 +26,129 @@ except ImportError:
 CCXT_EXCHANGE_IDS = {
     "bybit": "bybit",
     "binance": "binanceusdm",
-    "mexc": "mexc",      # возможно "mexc3" – при необходимости поменяешь
+    "mexc": "mexc",
     "gateio": "gate",
     "bingx": "bingx",
     "bitget": "bitget",
 }
 
-# Оценочные комиссии (в долях, не в %), если не удалось получить fee из ордера
-# (примерно 0.06% TAKER)
 DEFAULT_FEE_RATE = 0.0006
+
+
+# ============================================================
+# SYNC DATABASE HELPERS (вызываются через sync_to_async)
+# ============================================================
+
+def get_user_symbol_settings_sync(user, symbol):
+    """Получить настройки пользователя для символа"""
+    try:
+        return UserSymbolSettings.objects.get(user=user, symbol=symbol)
+    except UserSymbolSettings.DoesNotExist:
+        return None
+
+
+def get_bot_state_sync(user, symbol):
+    """Получить состояние бота"""
+    bot, _ = BotState.objects.update_or_create(
+        user=user,
+        symbol=symbol,
+        defaults={"last_update": timezone.now()},
+    )
+    return bot
+
+
+def save_bot_state_sync(user, symbol, data):
+    """Сохранить состояние бота"""
+    bot, _ = BotState.objects.update_or_create(
+        user=user,
+        symbol=symbol,
+        defaults={
+            "data": data,
+            "last_update": timezone.now()
+        }
+    )
+    return bot
+
+
+def get_active_trades_sync(user, symbol):
+    """Получить активные сделки"""
+    return list(Trade.objects.filter(
+        user=user,
+        symbol=symbol,
+        trade_type="arbitrage",
+        status="active",
+    ))
+
+
+def create_trade_sync(user, symbol, side, entry_price, amount, fees, exchanges):
+    """Создать новую сделку"""
+    trade = Trade.objects.create(
+        user=user,
+        trade_type="arbitrage",
+        symbol=symbol,
+        side=side.lower(),
+        entry_price=Decimal(str(entry_price)),
+        amount=Decimal(str(amount)),
+        pnl=Decimal("0"),
+        pnl_percent=Decimal("0"),
+        fees=Decimal(str(fees)),
+        status="active",
+        exchanges=exchanges,
+        strategy="futures_spread",
+    )
+    return trade
+
+
+def update_trade_sync(trade_id, exit_price, fees, pnl, pnl_percent, exchanges):
+    """Обновить сделку"""
+    trade = Trade.objects.get(id=trade_id)
+    trade.exit_price = Decimal(str(exit_price))
+    trade.fees = Decimal(str(fees))
+    trade.pnl = Decimal(str(pnl))
+    trade.pnl_percent = Decimal(str(pnl_percent))
+    trade.status = "completed"
+    trade.closed_at = timezone.now()
+    trade.exchanges = exchanges
+    trade.save()
+    return trade
+
+
+def create_bot_log_sync(user, trade_id, log_type, message, details):
+    """Создать лог"""
+    BotLog.objects.create(
+        user=user,
+        trade_id=trade_id,
+        log_type=log_type,
+        message=message,
+        details=details,
+    )
+
+
+def get_exchange_connection_sync(user, exchange_id):
+    """Получить подключение к бирже"""
+    try:
+        return ExchangeConnection.objects.get(
+            user=user,
+            exchange_id=exchange_id,
+            is_active=True
+        )
+    except ExchangeConnection.DoesNotExist:
+        return None
 
 
 class TradeEngine:
     """
-    Реальный фьючерсный спред-арбитраж:
-    - exchange_1 / exchange_2
-    - side = LONG / SHORT (для первой биржи)
-    - open_spread / close_spread (в %)
-    - order_size (в монетах)
-    - max_orders (количество одновременных спредов)
+    Реальный фьючерсный спред-арбитраж с полной поддержкой async
     """
 
     def __init__(self):
-        # user_id:symbol → bool
         self.running = {}
-        # user_id:symbol → asyncio.Task
         self.tasks = {}
-        # Хранилище тиков для графика: key → {"open": [], "close": [], "real": []}
         self.ticks = {}
-
-        # WebSocket
         self.channel_layer = get_channel_layer()
-
-        # Кэш ccxt-клиентов по пользователю и бирже
-        # key: f"{user_id}:{exchange_id}" → ccxt instance
         self.ccxt_clients = {}
 
-        # =====================================================
-        # Dedicated background asyncio loop (REQUIRED for Django)
-        # =====================================================
+        # Dedicated background asyncio loop
         import threading
 
         self.loop = asyncio.new_event_loop()
@@ -79,21 +164,14 @@ class TradeEngine:
         )
         self.loop_thread.start()
 
-
-    # ------------------------------------------------------
-    # Вспомогательный ключ
-    # ------------------------------------------------------
     def _key(self, user, symbol: str) -> str:
         return f"{user.id}:{symbol.upper()}"
 
-    # ------------------------------------------------------
-    # Получить / создать ccxt-клиента с ключами пользователя
-    # ------------------------------------------------------
-    def _get_ccxt_client(self, user, exchange_id: str):
-        """
-        Возвращает аутентифицированный ccxt-клиент фьючерсов.
-        Если нет ключей — возвращает None.
-        """
+    # ============================================================
+    # CCXT CLIENT (теперь async)
+    # ============================================================
+    async def _get_ccxt_client(self, user, exchange_id: str):
+        """Получить аутентифицированный ccxt-клиент (async)"""
         if ccxt is None:
             return None
 
@@ -106,15 +184,10 @@ class TradeEngine:
         if cache_key in self.ccxt_clients:
             return self.ccxt_clients[cache_key]
 
-        # Ищем подключение с API ключами
-        try:
-            conn = ExchangeConnection.objects.get(
-                user=user, exchange_id=exchange_id, is_active=True
-            )
-        except ExchangeConnection.DoesNotExist:
-            logger.warning(
-                f"No active ExchangeConnection for user={user.id}, exchange={exchange_id}"
-            )
+        # Получаем подключение через sync_to_async
+        conn = await sync_to_async(get_exchange_connection_sync)(user, exchange_id)
+        if not conn:
+            logger.warning(f"No active ExchangeConnection for user={user.id}, exchange={exchange_id}")
             return None
 
         api_key = encryption_service.decrypt(conn.api_key_encrypted)
@@ -136,11 +209,9 @@ class TradeEngine:
             "enableRateLimit": True,
         }
 
-        # Для некоторых бирж нужен password/passphrase
         if passphrase:
             params["password"] = passphrase
 
-        # Фьючерсы / swap (USDT-m)
         params.setdefault("options", {})
         params["options"].setdefault("defaultType", "swap")
 
@@ -148,41 +219,21 @@ class TradeEngine:
         self.ccxt_clients[cache_key] = client
         return client
 
-    # ------------------------------------------------------
-    # Асинхронный wrapper для sync-методов ccxt
-    # ------------------------------------------------------
     async def _run_sync(self, func, *args, **kwargs):
+        """Запустить синхронную функцию в executor"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-    # ------------------------------------------------------
-    # Построение unified futures-символа
-    # ------------------------------------------------------
     def _make_futures_symbol(self, base_symbol: str) -> str:
-        """
-        По умолчанию: BTC → BTC/USDT:USDT (унифицированный ccxt-символ
-        для USDT-маржинальных perpetual swap).
-        При необходимости потом сделаем маппинг по биржам.
-        """
+        """Построить unified futures символ"""
         base_symbol = base_symbol.upper()
         return f"{base_symbol}/USDT:USDT"
 
-    # ------------------------------------------------------
-    # Снимок рынка по бирже через ccxt
-    # ------------------------------------------------------
+    # ============================================================
+    # MARKET SNAPSHOT
+    # ============================================================
     async def _fetch_market_snapshot(self, user, exchange_id: str, symbol: str):
-        """
-        Возвращает dict:
-        {
-          "bid": float,
-          "ask": float,
-          "funding_rate": float | None,
-          "next_funding_time": str | None,
-          "mark_price": float | None,
-          "max_size": float | None,
-        }
-        или None, если не удалось получить.
-        """
+        """Получить снимок рынка"""
         if ccxt is None:
             return None
 
@@ -190,10 +241,8 @@ class TradeEngine:
         if not ccxt_id:
             return None
 
-        # Сначала пытаемся использовать аутентифицированный клиент
-        client = self._get_ccxt_client(user, exchange_id)
+        client = await self._get_ccxt_client(user, exchange_id)
 
-        # Если нет ключей — создаём публичный клиент
         if client is None:
             cls = getattr(ccxt, ccxt_id, None)
             if not cls:
@@ -202,7 +251,6 @@ class TradeEngine:
 
         market_symbol = self._make_futures_symbol(symbol)
 
-        # --- Ticker ---
         try:
             ticker = await self._run_sync(client.fetch_ticker, market_symbol)
         except Exception as e:
@@ -213,7 +261,6 @@ class TradeEngine:
         ask = ticker.get("ask") or ticker.get("askPrice")
         last = ticker.get("last") or ticker.get("lastPrice")
 
-        # --- Funding ---
         funding_rate = None
         next_funding = None
         try:
@@ -222,13 +269,10 @@ class TradeEngine:
                 funding_rate = funding.get("fundingRate")
                 ts = funding.get("fundingTimestamp") or funding.get("nextFundingTimestamp")
                 if ts:
-                    next_funding = datetime.datetime.fromtimestamp(
-                        ts / 1000.0
-                    ).isoformat()
+                    next_funding = datetime.datetime.fromtimestamp(ts / 1000.0).isoformat()
         except Exception as e:
             logger.debug(f"[{exchange_id}] fetch_funding_rate failed: {e}")
 
-        # --- Лимиты размера ---
         max_size = None
         try:
             markets = await self._run_sync(client.load_markets)
@@ -249,34 +293,18 @@ class TradeEngine:
             "max_size": float(max_size) if max_size is not None else None,
         }
 
-    # ------------------------------------------------------
-    # Создать один фьючерсный ордер (одна нога)
-    # ------------------------------------------------------
+    # ============================================================
+    # TRADING OPERATIONS
+    # ============================================================
     async def _open_leg(self, user, exchange_id: str, symbol: str, direction: str, amount: float):
-        """
-        direction: 'long' или 'short'
-        Возвращает dict:
-        {
-          "price": float,
-          "amount": float,
-          "fee": float,
-        }
-        или None при ошибке.
-        """
-        client = self._get_ccxt_client(user, exchange_id)
+        """Открыть одну ногу позиции"""
+        client = await self._get_ccxt_client(user, exchange_id)
         if client is None:
-            logger.warning(
-                f"Cannot open leg – no trading client for user={user.id}, exchange={exchange_id}"
-            )
+            logger.warning(f"Cannot open leg – no trading client for user={user.id}, exchange={exchange_id}")
             return None
 
         market_symbol = self._make_futures_symbol(symbol)
-
-        # LONG → buy, SHORT → sell
-        if direction.lower() == "long":
-            side = "buy"
-        else:
-            side = "sell"
+        side = "buy" if direction.lower() == "long" else "sell"
 
         try:
             order = await self._run_sync(
@@ -287,31 +315,25 @@ class TradeEngine:
                 amount,
             )
         except Exception as e:
-            logger.error(
-                f"create_order failed user={user.id}, ex={exchange_id}, sym={market_symbol}: {e}"
-            )
+            logger.error(f"create_order failed user={user.id}, ex={exchange_id}, sym={market_symbol}: {e}")
             return None
 
-        # Пытаемся достать среднюю цену
         price = (
             order.get("average")
             or order.get("price")
             or (order.get("info") or {}).get("avgPrice")
         )
 
-        # Пытаемся достать комиссию
         fee_total = 0.0
         if order.get("fee"):
             fee_total += float(order["fee"].get("cost", 0) or 0)
         if order.get("fees"):
             fee_total += sum(float(f.get("cost", 0) or 0) for f in order["fees"])
 
-        # Фолбэк — приблизительная комиссия
         if fee_total == 0 and price:
             fee_total = float(price) * float(amount) * DEFAULT_FEE_RATE
 
         if not price:
-            # Фолбэк: берём last price при отсутствии
             try:
                 ticker = await self._run_sync(client.fetch_ticker, market_symbol)
                 price = ticker.get("last") or ticker.get("close")
@@ -324,30 +346,15 @@ class TradeEngine:
             "fee": float(fee_total),
         }
 
-    # ------------------------------------------------------
-    # Закрыть ногу (противоположным ордером)
-    # ------------------------------------------------------
     async def _close_leg(self, user, exchange_id: str, symbol: str, direction: str, amount: float):
-        """
-        direction: 'long' или 'short' (НАПРАВЛЕНИЕ ИСХОДНОЙ ПОЗИЦИИ)
-        Для закрытия мы делаем reverse:
-        - если была long → sell
-        - если была short → buy
-        """
-        client = self._get_ccxt_client(user, exchange_id)
+        """Закрыть ногу позиции"""
+        client = await self._get_ccxt_client(user, exchange_id)
         if client is None:
-            logger.warning(
-                f"Cannot close leg – no trading client for user={user.id}, exchange={exchange_id}"
-            )
+            logger.warning(f"Cannot close leg – no trading client for user={user.id}, exchange={exchange_id}")
             return None
 
         market_symbol = self._make_futures_symbol(symbol)
-
-        # reverse side
-        if direction.lower() == "long":
-            side = "sell"
-        else:
-            side = "buy"
+        side = "sell" if direction.lower() == "long" else "buy"
 
         try:
             order = await self._run_sync(
@@ -358,9 +365,7 @@ class TradeEngine:
                 amount,
             )
         except Exception as e:
-            logger.error(
-                f"close_order failed user={user.id}, ex={exchange_id}, sym={market_symbol}: {e}"
-            )
+            logger.error(f"close_order failed user={user.id}, ex={exchange_id}, sym={market_symbol}: {e}")
             return None
 
         price = (
@@ -391,9 +396,9 @@ class TradeEngine:
             "fee": float(fee_total),
         }
 
-    # ------------------------------------------------------
-    # Открыть арбитражную позицию (две ноги)
-    # ------------------------------------------------------
+    # ============================================================
+    # ARBITRAGE POSITIONS
+    # ============================================================
     async def _open_arbitrage_position(
         self,
         user,
@@ -405,21 +410,16 @@ class TradeEngine:
         ask2: float,
         open_spread: float,
     ):
-        """
-        Открываем:
-        - exchange_1: side (LONG/SHORT)
-        - exchange_2: противоположная сторона
-        """
+        """Открыть арбитражную позицию"""
         exchange_1 = settings.exchange_1
         exchange_2 = settings.exchange_2
-        base_side = settings.side.upper()  # LONG / SHORT
+        base_side = settings.side.upper()
         amount = float(settings.order_size or 0.0)
 
         if amount <= 0:
             logger.warning(f"order_size=0, skip open_arbitrage for user={user.id}, {symbol}")
             return
 
-        # Определяем направление для каждой биржи
         if base_side == "LONG":
             leg1_dir = "long"
             leg2_dir = "short"
@@ -427,76 +427,65 @@ class TradeEngine:
             leg1_dir = "short"
             leg2_dir = "long"
 
-        # --- Открываем ногу 1 ---
         leg1 = await self._open_leg(user, exchange_1, symbol, leg1_dir, amount)
         if not leg1 or leg1["price"] is None:
             logger.error("Failed to open leg1, aborting arbitrage open")
             return
 
-        # --- Открываем ногу 2 ---
         leg2 = await self._open_leg(user, exchange_2, symbol, leg2_dir, amount)
         if not leg2 or leg2["price"] is None:
-            logger.error("Failed to open leg2, arbitrage HALF-OPEN (требуется ручной контроль)")
-            # TODO: в идеале попытаться компенсировать и закрыть leg1
+            logger.error("Failed to open leg2, arbitrage HALF-OPEN")
             return
 
         entry_price_1 = leg1["price"]
         entry_price_2 = leg2["price"]
         total_fee = float(leg1["fee"] + leg2["fee"])
 
-        # Создаём запись Trade
         notional = (entry_price_1 + entry_price_2) * amount
-        entry_spread = open_spread  # в %
+        entry_spread = open_spread
 
-        trade = Trade.objects.create(
-            user=user,
-            trade_type="arbitrage",
-            symbol=symbol,
-            side=base_side.lower(),  # long/short
-            entry_price=Decimal(str((entry_price_1 + entry_price_2) / 2.0)),
-            amount=Decimal(str(amount)),
-            pnl=Decimal("0"),
-            pnl_percent=Decimal("0"),
-            fees=Decimal(str(total_fee)),
-            status="active",
-            exchanges={
-                "exchange_1": {
-                    "id": exchange_1,
-                    "direction": leg1_dir,   # long/short
-                    "entry_price": entry_price_1,
-                    "amount": amount,
-                    "fee_open": leg1["fee"],
-                },
-                "exchange_2": {
-                    "id": exchange_2,
-                    "direction": leg2_dir,
-                    "entry_price": entry_price_2,
-                    "amount": amount,
-                    "fee_open": leg2["fee"],
-                },
-                "entry_spread": entry_spread,
-                "notional": notional,
+        exchanges_data = {
+            "exchange_1": {
+                "id": exchange_1,
+                "direction": leg1_dir,
+                "entry_price": entry_price_1,
+                "amount": amount,
+                "fee_open": leg1["fee"],
             },
-            strategy="futures_spread",
+            "exchange_2": {
+                "id": exchange_2,
+                "direction": leg2_dir,
+                "entry_price": entry_price_2,
+                "amount": amount,
+                "fee_open": leg2["fee"],
+            },
+            "entry_spread": entry_spread,
+            "notional": notional,
+        }
+
+        # Создаем сделку через sync_to_async
+        trade = await sync_to_async(create_trade_sync)(
+            user,
+            symbol,
+            base_side,
+            (entry_price_1 + entry_price_2) / 2.0,
+            amount,
+            total_fee,
+            exchanges_data
         )
 
         # Лог
-        BotLog.objects.create(
-            user=user,
-            trade=trade,
-            log_type="buy",
-            message=(
-                f"Opened arbitrage {symbol}: "
-                f"{exchange_1} {leg1_dir.upper()} @ {entry_price_1}, "
-                f"{exchange_2} {leg2_dir.upper()} @ {entry_price_2}, "
-                f"entry_spread={entry_spread:.4f}%"
-            ),
-            details=trade.exchanges,
+        await sync_to_async(create_bot_log_sync)(
+            user,
+            trade.id,
+            "buy",
+            f"Opened arbitrage {symbol}: "
+            f"{exchange_1} {leg1_dir.upper()} @ {entry_price_1}, "
+            f"{exchange_2} {leg2_dir.upper()} @ {entry_price_2}, "
+            f"entry_spread={entry_spread:.4f}%",
+            exchanges_data
         )
 
-    # ------------------------------------------------------
-    # Закрыть ВСЕ активные арбитражные позиции для символа
-    # ------------------------------------------------------
     async def _close_all_arbitrage_positions(
         self,
         user,
@@ -508,18 +497,17 @@ class TradeEngine:
         ask2: float,
         close_spread: float,
     ):
+        """Закрыть все активные арбитражные позиции"""
         exchange_1 = settings.exchange_1
         exchange_2 = settings.exchange_2
 
-        active_trades = Trade.objects.filter(
-            user=user,
-            symbol=symbol,
-            trade_type="arbitrage",
-            status="active",
-        )
+        # Получаем активные сделки через sync_to_async
+        active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
 
-        if not active_trades.exists():
+        if not active_trades:
             return
+
+        base_side = settings.side.upper()
 
         for trade in active_trades:
             ex_data = trade.exchanges or {}
@@ -533,14 +521,11 @@ class TradeEngine:
             if amount <= 0:
                 continue
 
-            # Закрываем ноги
             leg1_close = await self._close_leg(user, exchange_1, symbol, leg1_dir, amount)
             leg2_close = await self._close_leg(user, exchange_2, symbol, leg2_dir, amount)
 
             if not leg1_close or not leg2_close or leg1_close["price"] is None or leg2_close["price"] is None:
-                logger.error(
-                    f"Failed to close arbitrage trade {trade.id} fully, legs: {leg1_close}, {leg2_close}"
-                )
+                logger.error(f"Failed to close arbitrage trade {trade.id} fully")
                 continue
 
             exit_price_1 = leg1_close["price"]
@@ -551,61 +536,50 @@ class TradeEngine:
 
             entry_price_1 = float(leg1_info.get("entry_price") or trade.entry_price)
             entry_price_2 = float(leg2_info.get("entry_price") or trade.entry_price)
-            entry_spread = float(ex_data.get("entry_spread") or 0.0)
 
             amount_f = float(amount)
             notional = float(ex_data.get("notional") or (entry_price_1 + entry_price_2) * amount_f)
 
-            # PnL по ногам
-            # Если base_side == LONG → leg1 long, leg2 short
-            # Если base_side == SHORT → leg1 short, leg2 long
-            base_side = trade.side.upper()
-
             if base_side == "LONG":
-                # leg1 long: profit = (exit - entry) * amount
                 profit1 = (exit_price_1 - entry_price_1) * amount_f
-                # leg2 short: profit = (entry - exit) * amount
                 profit2 = (entry_price_2 - exit_price_2) * amount_f
             else:
-                # leg1 short
                 profit1 = (entry_price_1 - exit_price_1) * amount_f
-                # leg2 long
                 profit2 = (exit_price_2 - entry_price_2) * amount_f
 
             pnl_total = profit1 + profit2 - total_fee
             pnl_percent = (pnl_total / notional * 100.0) if notional > 0 else 0.0
 
-            # Обновляем Trade
-            trade.exit_price = Decimal(str((exit_price_1 + exit_price_2) / 2.0))
-            trade.fees = Decimal(str(total_fee))
-            trade.pnl = Decimal(str(pnl_total))
-            trade.pnl_percent = Decimal(str(pnl_percent))
-            trade.status = "completed"
-            trade.closed_at = timezone.now()
-
             ex_data["exit_spread"] = close_spread
             ex_data["exit_price_1"] = exit_price_1
             ex_data["exit_price_2"] = exit_price_2
             ex_data["fee_close"] = close_fee_total
-            trade.exchanges = ex_data
 
-            trade.save()
-
-            BotLog.objects.create(
-                user=user,
-                trade=trade,
-                log_type="profit" if pnl_total >= 0 else "error",
-                message=(
-                    f"Closed arbitrage {symbol}, PnL={pnl_total:.4f} USDT "
-                    f"({pnl_percent:.42f}%), close_spread={close_spread:.4f}%"
-                ),
-                details=ex_data,
+            # Обновляем сделку через sync_to_async
+            await sync_to_async(update_trade_sync)(
+                trade.id,
+                (exit_price_1 + exit_price_2) / 2.0,
+                total_fee,
+                pnl_total,
+                pnl_percent,
+                ex_data
             )
 
-    # ------------------------------------------------------
-    # async START/STOP (под твой views.py)
-    # ------------------------------------------------------
+            # Лог
+            await sync_to_async(create_bot_log_sync)(
+                user,
+                trade.id,
+                "profit" if pnl_total >= 0 else "error",
+                f"Closed arbitrage {symbol}, PnL={pnl_total:.4f} USDT "
+                f"({pnl_percent:.2f}%), close_spread={close_spread:.4f}%",
+                ex_data
+            )
+
+    # ============================================================
+    # MAIN LOOP
+    # ============================================================
     async def start(self, symbol, user):
+        """Запустить бота"""
         symbol = symbol.upper()
         key = self._key(user, symbol)
 
@@ -619,16 +593,15 @@ class TradeEngine:
         logger.info(f"Bot started: {key}")
 
     async def stop(self, symbol, user):
+        """Остановить бота"""
         symbol = symbol.upper()
         key = self._key(user, symbol)
 
         self.running[key] = False
         logger.info(f"Bot stop requested: {key}")
 
-    # ------------------------------------------------------
-    # Основной цикл – 1 апдейт в секунду
-    # ------------------------------------------------------
     async def main_loop(self, user, symbol):
+        """Основной торговый цикл"""
         symbol = symbol.upper()
         key = self._key(user, symbol)
 
@@ -642,19 +615,17 @@ class TradeEngine:
                 break
             except Exception as e:
                 logger.error(f"Main loop error [{key}]: {e}")
+                await asyncio.sleep(1.0)
 
         logger.info(f"Main loop finished for {key}")
 
-    # ------------------------------------------------------
-    # Обновление состояния бота (сердце логики)
-    # ------------------------------------------------------
     async def update_state(self, user, symbol):
+        """Обновить состояние бота (сердце логики)"""
         symbol = symbol.upper()
 
-        # 1. Настройки пользователя
-        try:
-            settings = UserSymbolSettings.objects.get(user=user, symbol=symbol)
-        except UserSymbolSettings.DoesNotExist:
+        # Получаем настройки через sync_to_async
+        settings = await sync_to_async(get_user_symbol_settings_sync)(user, symbol)
+        if not settings:
             return
 
         exchange_1 = settings.exchange_1
@@ -663,18 +634,14 @@ class TradeEngine:
         if not exchange_1 or not exchange_2:
             return
 
-        # 2. BotState
-        bot, _ = BotState.objects.update_or_create(
-            user=user,
-            symbol=symbol,
-            defaults={"last_update": timezone.now()},
-        )
+        # Получаем состояние бота через sync_to_async
+        bot = await sync_to_async(get_bot_state_sync)(user, symbol)
 
-        # 3. Снимаем данные с бирж
+        # Снимаем данные с бирж
         snap1 = await self._fetch_market_snapshot(user, exchange_1, symbol)
         snap2 = await self._fetch_market_snapshot(user, exchange_2, symbol)
 
-        # Если не получилось — fallback на рандом, без торговли
+        # Fallback на эмуляцию если нет данных
         if (
             not snap1
             or not snap2
@@ -685,7 +652,6 @@ class TradeEngine:
         ):
             bid1 = random.uniform(100, 101)
             ask1 = bid1 + random.uniform(0.01, 0.05)
-
             bid2 = random.uniform(100, 101)
             ask2 = bid2 + random.uniform(0.01, 0.05)
 
@@ -716,7 +682,7 @@ class TradeEngine:
 
             real_market = True
 
-        # 4. Расчёт спредов
+        # Расчёт спредов
         open_spread = (bid2 - ask1) / ask1 * 100 if ask1 and bid2 else 0
         close_spread = (bid1 - ask2) / ask2 * 100 if bid1 and ask2 else 0
 
@@ -728,8 +694,7 @@ class TradeEngine:
         ticks["open"].append(float(open_spread))
         ticks["close"].append(float(close_spread))
 
-        # Реальный "спред позиции"
-        base_side = settings.side.upper()  # LONG/SHORT
+        base_side = settings.side.upper()
         real_spread = open_spread if base_side == "LONG" else close_spread
         ticks["real"].append(float(real_spread))
 
@@ -738,27 +703,19 @@ class TradeEngine:
             if len(arr) > 200:
                 arr.pop(0)
 
-        # 5. Вход/выход из позиций (только если есть реальные данные и ключи)
-        active_trades = Trade.objects.filter(
-            user=user,
-            symbol=symbol,
-            trade_type="arbitrage",
-            status="active",
-        )
+        # Получаем активные сделки через sync_to_async
+        active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
 
-        # Условия блокировок
         force_stop = settings.force_stop
         total_stop = settings.total_stop
 
-        # --- ВХОД ---
+        # ВХОД
         if (
             real_market
             and not force_stop
             and not total_stop
-            and active_trades.count() < (settings.max_orders or 1)
+            and len(active_trades) < (settings.max_orders or 1)
         ):
-            # Если side=LONG → ждём, когда open_spread >= open_spread_threshold
-            # Если side=SHORT → ждём обратного условия
             open_thr = float(settings.open_spread or 0.0)
 
             if base_side == "LONG":
@@ -778,19 +735,12 @@ class TradeEngine:
                     open_spread,
                 )
                 # Перечитываем активные сделки
-                active_trades = Trade.objects.filter(
-                    user=user,
-                    symbol=symbol,
-                    trade_type="arbitrage",
-                    status="active",
-                )
+                active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
 
-        # --- ВЫХОД ---
-        if real_market and active_trades.exists():
+        # ВЫХОД
+        if real_market and active_trades:
             close_thr = float(settings.close_spread or 0.0)
 
-            # Для LONG, как правило, хотим, чтобы close_spread был <= порога
-            # Для SHORT — зеркально.
             if base_side == "LONG":
                 close_condition = close_spread <= close_thr
             else:
@@ -807,27 +757,19 @@ class TradeEngine:
                     ask2,
                     close_spread,
                 )
-                active_trades = Trade.objects.filter(
-                    user=user,
-                    symbol=symbol,
-                    trade_type="arbitrage",
-                    status="active",
-                )
+                active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
 
-        # 6. Текущий нереализованный PnL по активным сделкам
+        # Текущий нереализованный PnL
         unrealized_pnl = 0.0
         unrealized_pnl_percent = 0.0
 
-        if active_trades.exists():
+        if active_trades:
             total_notional = 0.0
             for t in active_trades:
                 ex_data = t.exchanges or {}
                 entry_spread = float(ex_data.get("entry_spread") or 0.0)
-                notional = float(ex_data.get("notional") or 0.0) or float(
-                    t.entry_price * t.amount * 2
-                )
+                notional = float(ex_data.get("notional") or 0.0) or float(t.entry_price * t.amount * 2)
 
-                # Аппроксимация: PnL ≈ (entry_spread - current_spread) * notional / 100
                 if base_side == "LONG":
                     spread_diff = entry_spread - close_spread
                 else:
@@ -841,69 +783,55 @@ class TradeEngine:
             if total_notional > 0:
                 unrealized_pnl_percent = unrealized_pnl / total_notional * 100.0
 
-        # 7. Обновляем bot.data
-        bot.data = {
+        # Обновляем bot.data
+        bot_data = {
             "exchange_1": exchange_1,
             "exchange_2": exchange_2,
             "side": settings.side,
-
-            # Спреды
             "open_spread": round(open_spread, 5),
             "close_spread": round(close_spread, 5),
-
-            # Биржа 1
             "funding_rate_1": funding_1,
             "next_funding_1": next_funding_1,
             "bid_1": bid1,
             "ask_1": ask1,
             "mark_price_1": mark_1,
             "max_size_1": max_size_1,
-
-            # Биржа 2
             "funding_rate_2": funding_2,
             "next_funding_2": next_funding_2,
             "bid_2": bid2,
             "ask_2": ask2,
             "mark_price_2": mark_2,
             "max_size_2": max_size_2,
-
-            # Ticks для графика
             "ticks": ticks,
             "timestamp": datetime.datetime.now().isoformat(),
-
-            # Статистика по ордерам
-            "orders": active_trades.count(),
+            "orders": len(active_trades),
             "pnl": unrealized_pnl,
             "pnl_percent": unrealized_pnl_percent,
-            "realized_pnl": 0,  # можно суммировать по closed trades, если нужно
+            "realized_pnl": 0,
         }
 
-        bot.save()
+        # Сохраняем через sync_to_async
+        await sync_to_async(save_bot_state_sync)(user, symbol, bot_data)
 
-        # 8. WS push
-        await self.push_update(user, symbol, bot.data)
+        # WS push
+        await self.push_update(user, symbol, bot_data)
 
-    # ------------------------------------------------------
-    # WS PUSH
-    # ------------------------------------------------------
     async def push_update(self, user, symbol, data):
-        """
-        Отправляет обновление в группу trading_<user_id>
-        """
+        """Отправить обновление через WebSocket"""
         group = f"trading_{user.id}"
 
         await self.channel_layer.group_send(
             group,
             {
-                "type": "trading.update",
+                "type": "trading_update",  # 🔥 FIX: snake_case для Channels
                 "symbol": symbol,
                 "data": data,
             }
         )
 
-    # ------------------------------------------------------
-    # SYNC wrappers (для вызова из Django views)
-    # ------------------------------------------------------
+    # ============================================================
+    # SYNC WRAPPERS (для вызова из Django views)
+    # ============================================================
     def start_background(self, symbol, user_id):
         from django.contrib.auth import get_user_model
         from asyncio import run_coroutine_threadsafe
@@ -921,7 +849,6 @@ class TradeEngine:
             self.loop,
         )
 
-
     def stop_background(self, symbol, user_id):
         from django.contrib.auth import get_user_model
         from asyncio import run_coroutine_threadsafe
@@ -938,9 +865,6 @@ class TradeEngine:
             self.stop(symbol, user),
             self.loop,
         )
-
-
-
 
 
 # Синглтон
