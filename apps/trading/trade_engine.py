@@ -3,6 +3,7 @@ import asyncio
 import datetime
 import logging
 import random
+import time
 from decimal import Decimal
 
 from django.utils import timezone
@@ -33,34 +34,35 @@ CCXT_EXCHANGE_IDS = {
 }
 
 DEFAULT_FEE_RATE = 0.0006
+PERSIST_INTERVAL = 30  # Сохранять состояние в БД раз в 30 секунд
 
 
 # ============================================================
 # SYNC DATABASE HELPERS (вызываются через sync_to_async)
 # ============================================================
 
-def get_user_symbol_settings_sync(user, symbol):
+def get_user_symbol_settings_sync(user_id, symbol):
     """Получить настройки пользователя для символа"""
     try:
-        return UserSymbolSettings.objects.get(user=user, symbol=symbol)
+        return UserSymbolSettings.objects.get(user_id=user_id, symbol=symbol)
     except UserSymbolSettings.DoesNotExist:
         return None
 
 
-def get_bot_state_sync(user, symbol):
+def get_bot_state_sync(user_id, symbol):
     """Получить состояние бота"""
     bot, _ = BotState.objects.update_or_create(
-        user=user,
+        user_id=user_id,
         symbol=symbol,
         defaults={"last_update": timezone.now()},
     )
     return bot
 
 
-def save_bot_state_sync(user, symbol, data):
-    """Сохранить состояние бота"""
+def save_bot_state_sync(user_id, symbol, data):
+    """Сохранить состояние в БД (РЕДКО - только при событиях)"""
     bot, _ = BotState.objects.update_or_create(
-        user=user,
+        user_id=user_id,
         symbol=symbol,
         defaults={
             "data": data,
@@ -70,20 +72,20 @@ def save_bot_state_sync(user, symbol, data):
     return bot
 
 
-def get_active_trades_sync(user, symbol):
+def get_active_trades_sync(user_id, symbol):
     """Получить активные сделки"""
     return list(Trade.objects.filter(
-        user=user,
+        user_id=user_id,
         symbol=symbol,
         trade_type="arbitrage",
         status="active",
     ))
 
 
-def create_trade_sync(user, symbol, side, entry_price, amount, fees, exchanges):
+def create_trade_sync(user_id, symbol, side, entry_price, amount, fees, exchanges):
     """Создать новую сделку"""
     trade = Trade.objects.create(
-        user=user,
+        user_id=user_id,
         trade_type="arbitrage",
         symbol=symbol,
         side=side.lower(),
@@ -113,10 +115,10 @@ def update_trade_sync(trade_id, exit_price, fees, pnl, pnl_percent, exchanges):
     return trade
 
 
-def create_bot_log_sync(user, trade_id, log_type, message, details):
+def create_bot_log_sync(user_id, trade_id, log_type, message, details):
     """Создать лог"""
     BotLog.objects.create(
-        user=user,
+        user_id=user_id,
         trade_id=trade_id,
         log_type=log_type,
         message=message,
@@ -124,11 +126,11 @@ def create_bot_log_sync(user, trade_id, log_type, message, details):
     )
 
 
-def get_exchange_connection_sync(user, exchange_id):
+def get_exchange_connection_sync(user_id, exchange_id):
     """Получить подключение к бирже"""
     try:
         return ExchangeConnection.objects.get(
-            user=user,
+            user_id=user_id,
             exchange_id=exchange_id,
             is_active=True
         )
@@ -139,12 +141,18 @@ def get_exchange_connection_sync(user, exchange_id):
 class TradeEngine:
     """
     Реальный фьючерсный спред-арбитраж с полной поддержкой async
+    
+    Архитектура:
+    1. Realtime данные (каждую секунду) → ТОЛЬКО WebSocket
+    2. Persistence (редко) → БД только при событиях
     """
 
     def __init__(self):
         self.running = {}
         self.tasks = {}
         self.ticks = {}
+        self.last_persist = {}  # Timestamp последнего сохранения в БД
+        self.last_state = {}  # Последнее состояние для каждого бота
         self.channel_layer = get_channel_layer()
         self.ccxt_clients = {}
 
@@ -164,13 +172,14 @@ class TradeEngine:
         )
         self.loop_thread.start()
 
-    def _key(self, user, symbol: str) -> str:
-        return f"{user.id}:{symbol.upper()}"
+    def _key(self, user_id, symbol: str) -> str:
+        """Создать ключ для хранения состояния"""
+        return f"{user_id}:{symbol.upper()}"
 
     # ============================================================
     # CCXT CLIENT (теперь async)
     # ============================================================
-    async def _get_ccxt_client(self, user, exchange_id: str):
+    async def _get_ccxt_client(self, user_id, exchange_id: str):
         """Получить аутентифицированный ccxt-клиент (async)"""
         if ccxt is None:
             return None
@@ -180,14 +189,14 @@ class TradeEngine:
             logger.warning(f"Unsupported exchange_id for ccxt: {exchange_id}")
             return None
 
-        cache_key = f"{user.id}:{exchange_id}"
+        cache_key = f"{user_id}:{exchange_id}"
         if cache_key in self.ccxt_clients:
             return self.ccxt_clients[cache_key]
 
         # Получаем подключение через sync_to_async
-        conn = await sync_to_async(get_exchange_connection_sync)(user, exchange_id)
+        conn = await sync_to_async(get_exchange_connection_sync)(user_id, exchange_id)
         if not conn:
-            logger.warning(f"No active ExchangeConnection for user={user.id}, exchange={exchange_id}")
+            logger.warning(f"No active ExchangeConnection for user={user_id}, exchange={exchange_id}")
             return None
 
         api_key = encryption_service.decrypt(conn.api_key_encrypted)
@@ -232,7 +241,7 @@ class TradeEngine:
     # ============================================================
     # MARKET SNAPSHOT
     # ============================================================
-    async def _fetch_market_snapshot(self, user, exchange_id: str, symbol: str):
+    async def _fetch_market_snapshot(self, user_id, exchange_id: str, symbol: str):
         """Получить снимок рынка"""
         if ccxt is None:
             return None
@@ -241,7 +250,7 @@ class TradeEngine:
         if not ccxt_id:
             return None
 
-        client = await self._get_ccxt_client(user, exchange_id)
+        client = await self._get_ccxt_client(user_id, exchange_id)
 
         if client is None:
             cls = getattr(ccxt, ccxt_id, None)
@@ -296,11 +305,11 @@ class TradeEngine:
     # ============================================================
     # TRADING OPERATIONS
     # ============================================================
-    async def _open_leg(self, user, exchange_id: str, symbol: str, direction: str, amount: float):
+    async def _open_leg(self, user_id, exchange_id: str, symbol: str, direction: str, amount: float):
         """Открыть одну ногу позиции"""
-        client = await self._get_ccxt_client(user, exchange_id)
+        client = await self._get_ccxt_client(user_id, exchange_id)
         if client is None:
-            logger.warning(f"Cannot open leg – no trading client for user={user.id}, exchange={exchange_id}")
+            logger.warning(f"Cannot open leg – no trading client for user={user_id}, exchange={exchange_id}")
             return None
 
         market_symbol = self._make_futures_symbol(symbol)
@@ -315,7 +324,7 @@ class TradeEngine:
                 amount,
             )
         except Exception as e:
-            logger.error(f"create_order failed user={user.id}, ex={exchange_id}, sym={market_symbol}: {e}")
+            logger.error(f"create_order failed user={user_id}, ex={exchange_id}, sym={market_symbol}: {e}")
             return None
 
         price = (
@@ -346,11 +355,11 @@ class TradeEngine:
             "fee": float(fee_total),
         }
 
-    async def _close_leg(self, user, exchange_id: str, symbol: str, direction: str, amount: float):
+    async def _close_leg(self, user_id, exchange_id: str, symbol: str, direction: str, amount: float):
         """Закрыть ногу позиции"""
-        client = await self._get_ccxt_client(user, exchange_id)
+        client = await self._get_ccxt_client(user_id, exchange_id)
         if client is None:
-            logger.warning(f"Cannot close leg – no trading client for user={user.id}, exchange={exchange_id}")
+            logger.warning(f"Cannot close leg – no trading client for user={user_id}, exchange={exchange_id}")
             return None
 
         market_symbol = self._make_futures_symbol(symbol)
@@ -365,7 +374,7 @@ class TradeEngine:
                 amount,
             )
         except Exception as e:
-            logger.error(f"close_order failed user={user.id}, ex={exchange_id}, sym={market_symbol}: {e}")
+            logger.error(f"close_order failed user={user_id}, ex={exchange_id}, sym={market_symbol}: {e}")
             return None
 
         price = (
@@ -401,7 +410,7 @@ class TradeEngine:
     # ============================================================
     async def _open_arbitrage_position(
         self,
-        user,
+        user_id,
         symbol: str,
         settings,
         bid1: float,
@@ -417,7 +426,7 @@ class TradeEngine:
         amount = float(settings.order_size or 0.0)
 
         if amount <= 0:
-            logger.warning(f"order_size=0, skip open_arbitrage for user={user.id}, {symbol}")
+            logger.warning(f"order_size=0, skip open_arbitrage for user={user_id}, {symbol}")
             return
 
         if base_side == "LONG":
@@ -427,12 +436,12 @@ class TradeEngine:
             leg1_dir = "short"
             leg2_dir = "long"
 
-        leg1 = await self._open_leg(user, exchange_1, symbol, leg1_dir, amount)
+        leg1 = await self._open_leg(user_id, exchange_1, symbol, leg1_dir, amount)
         if not leg1 or leg1["price"] is None:
             logger.error("Failed to open leg1, aborting arbitrage open")
             return
 
-        leg2 = await self._open_leg(user, exchange_2, symbol, leg2_dir, amount)
+        leg2 = await self._open_leg(user_id, exchange_2, symbol, leg2_dir, amount)
         if not leg2 or leg2["price"] is None:
             logger.error("Failed to open leg2, arbitrage HALF-OPEN")
             return
@@ -465,7 +474,7 @@ class TradeEngine:
 
         # Создаем сделку через sync_to_async
         trade = await sync_to_async(create_trade_sync)(
-            user,
+            user_id,
             symbol,
             base_side,
             (entry_price_1 + entry_price_2) / 2.0,
@@ -476,7 +485,7 @@ class TradeEngine:
 
         # Лог
         await sync_to_async(create_bot_log_sync)(
-            user,
+            user_id,
             trade.id,
             "buy",
             f"Opened arbitrage {symbol}: "
@@ -485,10 +494,15 @@ class TradeEngine:
             f"entry_spread={entry_spread:.4f}%",
             exchanges_data
         )
+        
+        # Персистим состояние после открытия сделки
+        key = self._key(user_id, symbol)
+        if key in self.last_state:
+            await self.persist_state(user_id, symbol, self.last_state[key])
 
     async def _close_all_arbitrage_positions(
         self,
-        user,
+        user_id,
         symbol: str,
         settings,
         bid1: float,
@@ -502,7 +516,7 @@ class TradeEngine:
         exchange_2 = settings.exchange_2
 
         # Получаем активные сделки через sync_to_async
-        active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
+        active_trades = await sync_to_async(get_active_trades_sync)(user_id, symbol)
 
         if not active_trades:
             return
@@ -521,8 +535,8 @@ class TradeEngine:
             if amount <= 0:
                 continue
 
-            leg1_close = await self._close_leg(user, exchange_1, symbol, leg1_dir, amount)
-            leg2_close = await self._close_leg(user, exchange_2, symbol, leg2_dir, amount)
+            leg1_close = await self._close_leg(user_id, exchange_1, symbol, leg1_dir, amount)
+            leg2_close = await self._close_leg(user_id, exchange_2, symbol, leg2_dir, amount)
 
             if not leg1_close or not leg2_close or leg1_close["price"] is None or leg2_close["price"] is None:
                 logger.error(f"Failed to close arbitrage trade {trade.id} fully")
@@ -567,49 +581,83 @@ class TradeEngine:
 
             # Лог
             await sync_to_async(create_bot_log_sync)(
-                user,
+                user_id,
                 trade.id,
                 "profit" if pnl_total >= 0 else "error",
                 f"Closed arbitrage {symbol}, PnL={pnl_total:.4f} USDT "
                 f"({pnl_percent:.2f}%), close_spread={close_spread:.4f}%",
                 ex_data
             )
+        
+        # Персистим состояние после закрытия сделки
+        key = self._key(user_id, symbol)
+        if key in self.last_state:
+            await self.persist_state(user_id, symbol, self.last_state[key])
+
+    # ============================================================
+    # PERSISTENCE (только при событиях)
+    # ============================================================
+    async def persist_state(self, user_id, symbol, data):
+        """
+        Сохранить состояние в БД
+        ВАЖНО: Вызывается ТОЛЬКО при важных событиях, НЕ каждую секунду!
+        """
+        try:
+            await sync_to_async(save_bot_state_sync)(user_id, symbol, data)
+            logger.debug(f"Persisted state for {user_id}:{symbol}")
+        except Exception as e:
+            logger.error(f"Failed to persist state: {e}")
 
     # ============================================================
     # MAIN LOOP
     # ============================================================
-    async def start(self, symbol, user):
+    async def start(self, symbol, user_id):
         """Запустить бота"""
         symbol = symbol.upper()
-        key = self._key(user, symbol)
+        key = self._key(user_id, symbol)
 
         if self.running.get(key):
             logger.info(f"Bot already running for {key}")
             return
 
         self.running[key] = True
-        asyncio.create_task(self.main_loop(user, symbol))
+        self.last_persist[key] = time.time()
+        
+        # Персистим начальное состояние
+        await self.persist_state(user_id, symbol, {
+            "started_at": datetime.datetime.now().isoformat(),
+            "status": "starting",
+        })
+        
+        asyncio.create_task(self.main_loop(user_id, symbol))
 
         logger.info(f"Bot started: {key}")
 
-    async def stop(self, symbol, user):
+    async def stop(self, symbol, user_id):
         """Остановить бота"""
         symbol = symbol.upper()
-        key = self._key(user, symbol)
+        key = self._key(user_id, symbol)
+
+        # Сохраняем финальное состояние перед остановкой
+        if key in self.last_state:
+            final_state = self.last_state[key].copy()
+            final_state["stopped_at"] = datetime.datetime.now().isoformat()
+            final_state["status"] = "stopped"
+            await self.persist_state(user_id, symbol, final_state)
 
         self.running[key] = False
         logger.info(f"Bot stop requested: {key}")
 
-    async def main_loop(self, user, symbol):
+    async def main_loop(self, user_id, symbol):
         """Основной торговый цикл"""
         symbol = symbol.upper()
-        key = self._key(user, symbol)
+        key = self._key(user_id, symbol)
 
         logger.info(f"Main loop started for {key}")
 
         while self.running.get(key, False):
             try:
-                await self.update_state(user, symbol)
+                await self.update_state(user_id, symbol)
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break
@@ -619,12 +667,20 @@ class TradeEngine:
 
         logger.info(f"Main loop finished for {key}")
 
-    async def update_state(self, user, symbol):
-        """Обновить состояние бота (сердце логики)"""
+    async def update_state(self, user_id, symbol):
+        """
+        Обновить состояние бота (сердце логики)
+        
+        ВАЖНО: Этот метод работает каждую секунду
+        - Расчёты делаются в RAM
+        - Данные отправляются через WebSocket
+        - БД НЕ трогается (только при событиях)
+        """
         symbol = symbol.upper()
+        key = self._key(user_id, symbol)
 
         # Получаем настройки через sync_to_async
-        settings = await sync_to_async(get_user_symbol_settings_sync)(user, symbol)
+        settings = await sync_to_async(get_user_symbol_settings_sync)(user_id, symbol)
         if not settings:
             return
 
@@ -634,12 +690,9 @@ class TradeEngine:
         if not exchange_1 or not exchange_2:
             return
 
-        # Получаем состояние бота через sync_to_async
-        bot = await sync_to_async(get_bot_state_sync)(user, symbol)
-
         # Снимаем данные с бирж
-        snap1 = await self._fetch_market_snapshot(user, exchange_1, symbol)
-        snap2 = await self._fetch_market_snapshot(user, exchange_2, symbol)
+        snap1 = await self._fetch_market_snapshot(user_id, exchange_1, symbol)
+        snap2 = await self._fetch_market_snapshot(user_id, exchange_2, symbol)
 
         # Fallback на эмуляцию если нет данных
         if (
@@ -686,7 +739,6 @@ class TradeEngine:
         open_spread = (bid2 - ask1) / ask1 * 100 if ask1 and bid2 else 0
         close_spread = (bid1 - ask2) / ask2 * 100 if bid1 and ask2 else 0
 
-        key = self._key(user, symbol)
         if key not in self.ticks:
             self.ticks[key] = {"open": [], "close": [], "real": []}
 
@@ -704,7 +756,7 @@ class TradeEngine:
                 arr.pop(0)
 
         # Получаем активные сделки через sync_to_async
-        active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
+        active_trades = await sync_to_async(get_active_trades_sync)(user_id, symbol)
 
         force_stop = settings.force_stop
         total_stop = settings.total_stop
@@ -725,7 +777,7 @@ class TradeEngine:
 
             if open_condition:
                 await self._open_arbitrage_position(
-                    user,
+                    user_id,
                     symbol,
                     settings,
                     bid1,
@@ -735,7 +787,7 @@ class TradeEngine:
                     open_spread,
                 )
                 # Перечитываем активные сделки
-                active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
+                active_trades = await sync_to_async(get_active_trades_sync)(user_id, symbol)
 
         # ВЫХОД
         if real_market and active_trades:
@@ -748,7 +800,7 @@ class TradeEngine:
 
             if close_condition or force_stop or total_stop:
                 await self._close_all_arbitrage_positions(
-                    user,
+                    user_id,
                     symbol,
                     settings,
                     bid1,
@@ -757,7 +809,7 @@ class TradeEngine:
                     ask2,
                     close_spread,
                 )
-                active_trades = await sync_to_async(get_active_trades_sync)(user, symbol)
+                active_trades = await sync_to_async(get_active_trades_sync)(user_id, symbol)
 
         # Текущий нереализованный PnL
         unrealized_pnl = 0.0
@@ -783,7 +835,7 @@ class TradeEngine:
             if total_notional > 0:
                 unrealized_pnl_percent = unrealized_pnl / total_notional * 100.0
 
-        # Обновляем bot.data
+        # Обновляем bot.data (в RAM)
         bot_data = {
             "exchange_1": exchange_1,
             "exchange_2": exchange_2,
@@ -810,20 +862,26 @@ class TradeEngine:
             "realized_pnl": 0,
         }
 
-        # Сохраняем через sync_to_async
-        await sync_to_async(save_bot_state_sync)(user, symbol, bot_data)
+        # Сохраняем последнее состояние в RAM
+        self.last_state[key] = bot_data
 
-        # WS push
-        await self.push_update(user, symbol, bot_data)
+        # ✅ REALTIME: WebSocket push (каждую секунду)
+        await self.push_update(user_id, symbol, bot_data)
 
-    async def push_update(self, user, symbol, data):
+        # 🔹 OPTIONAL: Heartbeat persistence (раз в 30 секунд)
+        current_time = time.time()
+        if current_time - self.last_persist.get(key, 0) >= PERSIST_INTERVAL:
+            await self.persist_state(user_id, symbol, bot_data)
+            self.last_persist[key] = current_time
+
+    async def push_update(self, user_id, symbol, data):
         """Отправить обновление через WebSocket"""
-        group = f"trading_{user.id}"
+        group = f"trading_{user_id}"
 
         await self.channel_layer.group_send(
             group,
             {
-                "type": "trading_update",  # 🔥 FIX: snake_case для Channels
+                "type": "trading_update",
                 "symbol": symbol,
                 "data": data,
             }
@@ -833,36 +891,18 @@ class TradeEngine:
     # SYNC WRAPPERS (для вызова из Django views)
     # ============================================================
     def start_background(self, symbol, user_id):
-        from django.contrib.auth import get_user_model
         from asyncio import run_coroutine_threadsafe
 
-        User = get_user_model()
-
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            logger.error(f"User not found: {user_id}")
-            return
-
         run_coroutine_threadsafe(
-            self.start(symbol, user),
+            self.start(symbol, user_id),
             self.loop,
         )
 
     def stop_background(self, symbol, user_id):
-        from django.contrib.auth import get_user_model
         from asyncio import run_coroutine_threadsafe
 
-        User = get_user_model()
-
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            logger.error(f"User not found: {user_id}")
-            return
-
         run_coroutine_threadsafe(
-            self.stop(symbol, user),
+            self.stop(symbol, user_id),
             self.loop,
         )
 
